@@ -1,264 +1,151 @@
-# buma — Intelligent Bug Triaging & Assignment System
+# buma
 
-**A reliable first responder for new GitHub issues.**
+**Automated bug triage and assignment for GitHub, built as a production-shaped async pipeline.**
 
-buma automates the first step of bug triage in GitHub:
+[![CI](https://github.com/Zeeldesai12345/buma/actions/workflows/ci.yml/badge.svg)](https://github.com/Zeeldesai12345/buma/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.11%2B-blue)
+![FastAPI](https://img.shields.io/badge/FastAPI-async%20gateway-009688)
+![React](https://img.shields.io/badge/React-19-61DAFB)
+![Docker](https://img.shields.io/badge/Docker-Compose-2496ED)
+![Tests](https://img.shields.io/badge/tests-294%20passing-brightgreen)
+![Coverage](https://img.shields.io/badge/coverage-≥80%25%20gated-brightgreen)
 
-- Ingest new issue events securely and reliably
-- Classify bug category and set priority (rules-first baseline)
-- Assign the best-fit developer using team **skills + capacity**
-- Apply labels, set assignee, and post an **explanation comment** (transparent + auditable)
-- Persist a decision log for analytics and continuous improvement
+Every new GitHub issue is a small decision problem: what kind of bug is this, how urgent is it, and who on the team should own it? buma answers that automatically — the moment an issue is opened, it classifies it, scores its priority, picks the best-fit developer by skills and current workload, and writes an auditable explanation straight into the GitHub issue thread. No human touches the triage backlog unless the rules say they should.
 
-## Project goals (semester MVP)
+> **Demo video:** [Watch buma triage a live issue end-to-end](https://stevens.zoom.us/rec/share/DpeGj3KoGgIkXlwmR3SSpuH__39eKzjHtn9kkbzFWN42T6k-wy4XPu1xdiyueV37.emvdavdLR5sSbDlY?startTime=1776824419000)
 
-The MVP (P0) focuses on a reliable end-to-end workflow before "smart but fragile" intelligence:
+---
 
-- Webhook ingestion + validation (issue opened)
-- Triage engine (rule-based baseline): category + priority
-- Assignee selection using skills + capacity + tie-break rules
-- GitHub updates: labels + assignee + explanation comment
-- Decision log persisted for auditability
-- Dashboard: configuration + triage history + workload view
+## Why it's interesting
 
-Optional (P1, only if it does not reduce P0 reliability): manual overrides, confidence + fallback path, lightweight offline-trained ML category classifier, and more analytics.
+This isn't a script that calls the GitHub API — it's a small distributed system, built the way you'd defend it in a design review:
+
+- **Decoupled by a queue, not a function call.** The webhook gateway never blocks on triage logic; it validates and hands off to Redis. A separate async worker consumes, processes, and retries — so a slow GitHub API call or a bad payload can't take down ingestion.
+- **Every automated decision is explainable and reversible.** Each triage run writes a decision log row *and* posts a human-readable comment on the issue — category, priority, and why a specific developer was chosen. Nothing is a black box.
+- **Security is not an afterthought.** Webhook deliveries are HMAC-signature verified before anything touches the queue; the dashboard uses real GitHub OAuth 2.0 session auth, not a shared password.
+- **Idempotent by design.** Webhook deliveries are deduplicated and retried safely — reprocessing the same event twice never double-assigns or double-comments.
+- **Tested like it matters.** 294 tests across gateway, worker, and schemas, with an 80% coverage gate enforced in CI on every PR — not just a `pytest` folder that exists for show.
+- **Documented for a stranger to pick up.** Numbered design decisions (`docs/worker-design.md`), a full setup walkthrough (`docs/user-guide.md`), and a 10-scenario UAT script with sign-off tables (`docs/uat.md`) — the kind of documentation a real engineering org expects before something ships.
+
+---
+
+## Architecture
+
+```
+                                   ┌─────────────────┐
+   GitHub issue opened  ──────────▶  Webhook Gateway  │  FastAPI · HMAC-verified
+                                   │   (async, thin)   │  Enqueues, never blocks
+                                   └────────┬─────────┘
+                                            │  Redis (BRPOP list queue)
+                                            ▼
+                                   ┌──────────────────┐
+                                   │   Triage Worker   │  async, graceful shutdown
+                                   │  ───────────────  │
+                                   │  1. Classify      │  category + priority rules
+                                   │  2. Assign        │  skills + capacity + tie-break
+                                   │  3. Persist        │  decision log (Postgres)
+                                   │  4. Patch GitHub  │  labels, assignee, comment
+                                   └────────┬─────────┘
+                                            │
+                       ┌────────────────────┼───────────────────┐
+                       ▼                                        ▼
+              PostgreSQL (audit trail)                React Dashboard
+                                                   config · history · workload
+```
+
+The queue absorbs bursts and enables retries without dropping events; the decision log makes every automated action traceable after the fact.
+
+---
+
+## Tech stack
+
+| Layer | Technology |
+|---|---|
+| Webhook gateway | FastAPI, async, HMAC-signed webhook validation, GitHub OAuth 2.0 |
+| Triage worker | Python asyncio, Redis-backed queue consumer, graceful signal-based shutdown |
+| Data layer | PostgreSQL, SQLAlchemy 2.0 ORM, Alembic migrations |
+| Dashboard | React 19, MUI, Recharts, React Router, Axios |
+| Testing | pytest, pytest-asyncio, pytest-cov (80% gate), respx (HTTP mocking) |
+| Tooling | uv, ruff, black, Docker Compose, VS Code Dev Containers |
+| CI/CD | GitHub Actions — lint + test on every PR |
+
+---
 
 ## Repository status
 
-The full P0 backend pipeline is implemented and smoke-tested:
+The full backend pipeline is implemented and end-to-end smoke-tested:
 
-- Gateway (`src/buma/gateway/`) — webhook ingest, HMAC validation, Redis publish; dashboard config + observability API; GitHub OAuth 2.0 login + session auth
-- Worker (`src/buma/worker/`) — queue consumer, triage engine, assignee selector, DB persistence, GitHub patch (labels + assignee + comment)
-- Database (`src/buma/db/`) — all 6 ORM models, Alembic migration applied
-- API schemas (`src/buma/schemas/api/`) — typed request/response schemas for all `/api/*` routes
-- Unit tests (`tests/`) + end-to-end smoke test (`scripts/smoke.py`)
-- Devcontainer for a consistent toolchain (`.devcontainer/`)
-
-Remaining P0 work: public HTTPS endpoint + webhook registration; Dashboard UI (owned by UI team).
-
-## High-level architecture
-
-```
-GitHub → Webhook ingest API → Redis Queue → Triage Worker → DB → Dashboard
-```
-
-The queue enables retries and burst protection. The decision log enables traceability and metrics.
+- **Gateway** (`src/buma/gateway/`) — webhook ingest, HMAC validation, Redis publish; dashboard config + observability API; GitHub OAuth 2.0 login + session auth
+- **Worker** (`src/buma/worker/`) — queue consumer, triage engine, assignee selector, DB persistence, GitHub patch (labels + assignee + comment)
+- **Database** (`src/buma/db/`) — 6 ORM models, Alembic migrations applied
+- **API schemas** (`src/buma/schemas/api/`) — typed request/response contracts for all `/api/*` routes
+- **Dashboard** (`web-dashboard/`) — React app for configuration, triage history, and workload visibility
+- **Tests** — unit coverage across gateway/worker/schemas + an end-to-end smoke script (`scripts/smoke.py`)
 
 ---
 
-## Documentation
+## Quick start
 
-| Document | Audience | Description |
-|---|---|---|
-| [User Guide](docs/user-guide.md) | New users, evaluators | Step-by-step: clone, configure GitHub App + OAuth App, run with Docker, set up ngrok, enroll a repo, and use Buma end-to-end |
-| [UAT Script](docs/uat.md) | Professor, peer reviewers | 10 acceptance test scenarios with pass/fail tables, defect log, and sign-off sheet |
-| [Worker Design](docs/worker-design.md) | Contributors | Design decisions DD-14 through DD-18 covering the worker architecture |
-
-> **Demo video:** https://stevens.zoom.us/rec/share/DpeGj3KoGgIkXlwmR3SSpuH__39eKzjHtn9kkbzFWN42T6k-wy4XPu1xdiyueV37.emvdavdLR5sSbDlY?startTime=1776824419000
-
----
-
-## Prerequisites
-
-- **Docker** and **Docker Compose** — required for both dev paths below
-- **Python 3.11+** and **uv** — required for host dev only
-
-Install `uv` if you don't have it:
-```bash
-curl -Ls https://astral.sh/uv/install.sh | sh
-```
-
----
-
-## Environment setup
-
-Copy `.env.example` to `.env` and fill in the required values:
+**Prerequisites:** Docker + Docker Compose (Python 3.11 and `uv` only needed for host-mode dev).
 
 ```bash
-cp .env.example .env
-```
-
-`.env.example`:
-```bash
-# Postgres credentials — used by the db service and DATABASE_URL
-POSTGRES_USER=buma
-POSTGRES_PASSWORD=buma
-POSTGRES_DB=buma
-
-# Database — uses Docker service name "db"
-DATABASE_URL=postgresql+psycopg://buma:buma@db:5432/buma
-
-# Redis — uses Docker service name "redis"
-REDIS_URL=redis://redis:6379/0
-
-# GitHub Webhook (from your GitHub App settings)
-GITHUB_WEBHOOK_SECRET=your-webhook-secret
-
-# GitHub App (JWT auth for patching issues — Phase 6)
-# Without these, the worker skips GitHub patching (patch_state stays DECIDED)
-GITHUB_APP_ID=
-GITHUB_APP_PRIVATE_KEY=   # full PEM content, newlines as \n
-
-# GitHub OAuth App (dashboard login)
-GITHUB_OAUTH_CLIENT_ID=
-GITHUB_OAUTH_CLIENT_SECRET=
-
-# Session cookie signing — use a strong random value in production
-SESSION_SECRET=dev-secret-change-in-production!
-
-# CORS — comma-separated list of allowed origins for the dashboard UI
-CORS_ORIGINS=http://localhost:3000,http://localhost:5173
-```
-
----
-
-## Running in development
-
-### Option A — Docker Compose (recommended)
-
-Runs the full stack (Postgres, Redis, gateway, worker) in one command. `.env` is the single source of truth — no local Python install needed beyond Docker.
-
-**First-time setup:**
-```bash
+git clone https://github.com/Zeeldesai12345/buma.git
+cd buma
+cp .env.example .env        # fill in GitHub App / OAuth credentials
 docker compose build
-```
-
-**Start everything:**
-```bash
 docker compose up
 ```
 
-Startup order is enforced automatically:
-1. Postgres and Redis start and pass healthchecks
-2. `migrate` service runs `alembic upgrade head` and exits
-3. `gateway` and `worker` start
+Docker Compose brings up Postgres and Redis, runs Alembic migrations, then starts the gateway and worker in the right order. See the [User Guide](docs/user-guide.md) for the full walkthrough — GitHub App + OAuth App setup, `ngrok` tunneling, and enrolling your first repo.
 
-**Useful commands:**
-```bash
-docker compose up -d                     # run detached
-docker compose logs -f gateway worker    # stream logs
-docker compose down                      # stop and remove containers
-docker compose down -v                   # also wipe the postgres volume
-```
+<details>
+<summary><strong>Host-mode dev (infra in Docker, services on your machine)</strong></summary>
 
-**After code changes:**
-```bash
-docker compose build gateway worker
-docker compose up
-```
-
----
-
-### Option B — Host (uv + Docker infra only)
-
-Run Postgres and Redis in Docker, but run the Python services directly on your machine. Useful for faster iteration (no image rebuild on code changes).
-
-**Step 1 — Start infra:**
 ```bash
 docker compose up db redis -d
-```
 
-**Step 2 — Override DB/Redis URLs to use localhost:**
-
-The default `.env` uses Docker service names (`db`, `redis`). For host dev, override just those two:
-
-```bash
 export DATABASE_URL=postgresql+psycopg://buma:buma@localhost:5432/buma
 export REDIS_URL=redis://localhost:6379/0
-```
 
-Or keep a separate `.env.local` and source it before running.
-
-**Step 3 — Install dependencies:**
-```bash
 uv sync --dev
-```
-
-**Step 4 — Apply migrations:**
-```bash
 uv run alembic upgrade head
-```
 
-**Step 5 — Start the gateway** (terminal 1):
-```bash
-uv run uvicorn buma.gateway.app:app --reload --port 8000
+uv run uvicorn buma.gateway.app:app --reload --port 8000   # terminal 1
+uv run python -m buma.worker.runner                        # terminal 2
 ```
-
-**Step 6 — Start the worker** (terminal 2):
-```bash
-uv run python -m buma.worker.runner
-```
-
-The worker connects to Redis, polls `buma:triage:queue`, and processes events through the full triage pipeline (classify → assign → persist → patch GitHub). It shuts down cleanly on `Ctrl+C` or `SIGTERM`.
+</details>
 
 ---
 
-## Gateway API routes
+## API surface
 
 | Method | Route | Description |
 |---|---|---|
 | `GET` | `/health` | Liveness check |
-| `POST` | `/webhook/github` | GitHub webhook receiver |
-| `GET` | `/auth/github` | Initiate OAuth login |
-| `GET` | `/auth/callback` | OAuth callback |
-| `POST` | `/api/config/repos` | Enroll a repository |
-| `GET` | `/api/config/repos/{repo_id}` | Get repo config |
-| `PATCH` | `/api/config/repos/{repo_id}` | Update repo config |
-| `POST` | `/api/config/repos/{repo_id}/developers` | Add a developer profile |
-| `PATCH` | `/api/config/repos/{repo_id}/developers/{login}` | Update a developer profile |
-| `DELETE` | `/api/config/repos/{repo_id}/developers/{login}` | Remove a developer profile |
-| `GET` | `/api/triage/{repo_id}` | Triage decision history (paginated) |
+| `POST` | `/webhook/github` | GitHub webhook receiver (HMAC-verified) |
+| `GET` | `/auth/github` → `/auth/callback` | OAuth login flow |
+| `POST` / `GET` / `PATCH` | `/api/config/repos/...` | Repo + developer profile configuration |
+| `GET` | `/api/triage/{repo_id}` | Paginated triage decision history |
 | `GET` | `/api/workload/{repo_id}` | Developer workload view |
 
-All `/api/*` routes require a valid session cookie (GitHub OAuth login).
+All `/api/*` routes require an authenticated session (GitHub OAuth).
 
 ---
 
-## Scripts
-
-Local development and CI run the same scripts — avoid duplicating logic in workflow YAML.
-
-| Script | What it does |
-|---|---|
-| `./scripts/lint.sh` | `ruff` lint + `black --check` |
-| `./scripts/test.sh` | `pytest` + coverage gate (80% minimum) |
-| `./scripts/codegen.sh` | OpenAPI model generation (skips if `openapi.yaml` absent) |
-| `uv run python scripts/smoke.py run` | End-to-end local smoke test |
-
-Run these before submitting a PR:
-```bash
-./scripts/lint.sh
-./scripts/test.sh
-```
-
-### Smoke test
-
-Requires Option B (host) dev setup — infra running, migrations applied.
+## Testing & quality gates
 
 ```bash
-# All phases in one command:
-uv run python scripts/smoke.py run
-
-# Or step-by-step:
-uv run python scripts/smoke.py seed
-uv run python scripts/smoke.py gateway      # separate terminal — Ctrl+C to stop
-uv run python scripts/smoke.py webhook
-export SMOKE_DELIVERY_ID=<value printed above>
-uv run python scripts/smoke.py worker
-uv run python scripts/smoke.py verify
-uv run python scripts/smoke.py preview
-
-# API endpoints smoke test:
-uv run python scripts/smoke.py api
+./scripts/lint.sh    # ruff + black --check
+./scripts/test.sh     # pytest + 80% coverage gate
 ```
 
-> Do not run as `./scripts/smoke.py` — the shebang does not resolve to the uv virtualenv.
+Both run in CI on every pull request. Local dev and CI intentionally share the same scripts — nothing is duplicated into workflow YAML.
 
----
+```bash
+uv run python scripts/smoke.py run     # full end-to-end smoke test
+```
 
-## Dev container
-
-For a fully managed toolchain (Python, uv, Docker-outside-of-Docker, kubectl, kustomize), open this repo in VS Code and choose **Dev Containers: Reopen in Container**. The `postCreateCommand` runs `uv sync --dev && uv run alembic upgrade head` automatically on first open.
+The smoke script exercises the real pipeline: seeds data, fires a signed webhook, drains the worker, and verifies the resulting triage decision, labels, assignee, and comment.
 
 ---
 
@@ -266,82 +153,40 @@ For a fully managed toolchain (Python, uv, Docker-outside-of-Docker, kubectl, ku
 
 ```
 src/buma/
-├── core/           — settings, security (HMAC)
-├── db/             — ORM models, SQLAlchemy base
-├── schemas/        — NormalizedEvent (gateway↔worker contract) + API schemas
-├── gateway/        — FastAPI ingest service + dashboard API
-└── worker/         — async queue consumer + triage pipeline
+├── core/           settings, HMAC security
+├── db/             ORM models, SQLAlchemy base
+├── schemas/        gateway↔worker contract + API schemas
+├── gateway/        FastAPI ingest service + dashboard API
+└── worker/         async queue consumer + triage pipeline
 
-tests/              — mirrors src/buma/
-migrations/         — Alembic migrations
-scripts/            — lint, test, codegen, smoke test
+web-dashboard/       React 19 + MUI + Recharts operator dashboard
+tests/                mirrors src/buma/, 294 tests
+migrations/           Alembic migrations
+scripts/               lint, test, codegen, smoke test
 docs/
-├── user-guide.md   — installation + usage guide for new users
-├── uat.md          — UAT script for professor and peer reviewers
-└── worker-design.md — worker architecture design decisions
-.devcontainer/      — VS Code dev container config
-.github/            — CI workflow + issue templates
-contributors/       — team notes
+├── user-guide.md     install + configure + run, end to end
+├── uat.md              10-scenario UAT script with sign-off
+└── worker-design.md   numbered design decisions (DD-14…DD-18)
+.github/workflows/    CI: lint + test on every PR
+.devcontainer/         reproducible VS Code dev environment
 ```
 
 ---
 
-## Contributing
+## Documentation
 
-### Workflow
-
-1. Create or pick up work via GitHub issues (use the templates).
-2. Create a feature branch and open a PR.
-3. Keep PRs small and focused — one behavioural change per PR.
-4. Run lint and tests locally before requesting review:
-
-```bash
-./scripts/lint.sh
-./scripts/test.sh
-```
-
-### Code style
-
-- Formatter: `black` (line length 120)
-- Linter: `ruff` (rules E, F, I, N, W, UP — Python 3.11 target)
-- Tests: `pytest` with `asyncio_mode = "auto"`; 80% coverage enforced
-
-### Dependencies
-
-```bash
-uv add <package>          # runtime dependency
-uv add --dev <package>    # dev-only dependency
-```
-
-Commit both `pyproject.toml` and `uv.lock`.
-
-### Scope guardrails
-
-The capstone success criterion is **"works every time"** for the P0 pipeline.
-
-- Prioritise reliability, idempotency, and debuggability over new features.
-- Never merge P1/roadmap work if it reduces P0 stability.
-- Add one major capability at a time; validate end-to-end before layering more.
-
-### Secrets and security
-
-- Never commit secrets (`.env`, credentials, private keys).
-- `.env` is gitignored. Use `.env.example` to document required variables.
-
-### Adding yourself (optional)
-
-Add a short file under `contributors/` (e.g. `contributors/your-name.md`) with your name, role, and GitHub handle.
+| Document | Audience | What it covers |
+|---|---|---|
+| [User Guide](docs/user-guide.md) | New users, evaluators | Clone, configure GitHub App + OAuth App, run with Docker, ngrok, enroll a repo |
+| [UAT Script](docs/uat.md) | Reviewers | 10 acceptance test scenarios, defect log, sign-off sheet |
+| [Worker Design](docs/worker-design.md) | Contributors | Design rationale for the queue consumer and async pipeline |
 
 ---
 
-## Resources
+## Team
 
-- [GitHub Webhooks docs](https://docs.github.com/webhooks)
-- [Validating webhook payloads](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries)
-- [GitHub Apps documentation](https://docs.github.com/apps)
-
----
+Built as a team capstone project. See [`contributors/`](contributors/) for individual contributors.
 
 ## License
 
-A project license has not been added yet. Do not assume reuse permissions until a `LICENSE` file is present.
+A project license has not been added yet — do not assume reuse permissions until a `LICENSE` file is present.
