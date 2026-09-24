@@ -7,6 +7,7 @@ import pytest
 
 from buma.schemas.normalized_event import IssueRef
 from buma.worker.services.triage_engine import (
+    BUDGET_ENGINE_VERSION,
     CLAUDE_ENGINE_VERSION,
     ENGINE_VERSION,
     FALLBACK_ENGINE_VERSION,
@@ -281,8 +282,10 @@ def mock_claude() -> AsyncMock:
     return AsyncMock()
 
 
-def _claude_result(confidence: float = 0.8) -> TriageResult:
-    return TriageResult(category="security", priority="P0", confidence=confidence, engine_version=CLAUDE_ENGINE_VERSION)
+def _claude_result(confidence: float = 0.8, priority: str = "P1") -> TriageResult:
+    return TriageResult(
+        category="security", priority=priority, confidence=confidence, engine_version=CLAUDE_ENGINE_VERSION
+    )
 
 
 async def test_no_classifier_configured_behaves_like_rules_only() -> None:
@@ -309,7 +312,7 @@ async def test_low_confidence_triggers_claude_call(mock_claude: AsyncMock) -> No
     issue = _issue(title="something happened")  # confidence 0.0 -> below threshold
     await engine.classify_with_fallback(issue, config={})
 
-    mock_claude.classify.assert_called_once_with(issue)
+    mock_claude.classify.assert_called_once_with(issue, event_id=None)
 
 
 async def test_successful_claude_response_is_used(mock_claude: AsyncMock) -> None:
@@ -319,8 +322,9 @@ async def test_successful_claude_response_is_used(mock_claude: AsyncMock) -> Non
     result = await engine.classify_with_fallback(_issue(title="something happened"), config={})
 
     assert result.category == "security"
-    assert result.priority == "P0"
+    assert result.priority == "P1"
     assert result.confidence == 0.8
+    assert result.note is None
     assert result.engine_version == CLAUDE_ENGINE_VERSION
 
 
@@ -354,3 +358,121 @@ async def test_claude_fallback_preserves_rule_confidence_on_failure(mock_claude:
 
     assert result.confidence == pytest.approx(0.7)
     assert result.engine_version == FALLBACK_ENGINE_VERSION
+
+
+# ---------------------------------------------------------------------------
+# Guardrails — cost gate (LLMBudget) and severity ceiling
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def mock_budget() -> AsyncMock:
+    budget = AsyncMock()
+    budget.allow.return_value = True
+    return budget
+
+
+async def test_budget_refusal_skips_claude_and_uses_budget_engine_version(
+    mock_claude: AsyncMock, mock_budget: AsyncMock
+) -> None:
+    mock_budget.allow.return_value = False
+    engine = TriageEngine(claude_classifier=mock_claude, llm_budget=mock_budget)
+
+    result = await engine.classify_with_fallback(_issue(title="something happened"), config={}, repo_id=111)
+
+    mock_budget.allow.assert_awaited_once_with(111)
+    mock_claude.classify.assert_not_called()
+    mock_budget.record.assert_not_called()
+    assert result.category == "bug"
+    assert result.engine_version == BUDGET_ENGINE_VERSION
+
+
+async def test_budget_not_consulted_when_rules_are_confident(mock_claude: AsyncMock, mock_budget: AsyncMock) -> None:
+    engine = TriageEngine(claude_classifier=mock_claude, llm_budget=mock_budget)
+    await engine.classify_with_fallback(_issue(title="issue", labels=["bug"]), config={}, repo_id=111)
+    mock_budget.allow.assert_not_called()
+
+
+async def test_successful_claude_call_is_recorded_ok(mock_claude: AsyncMock, mock_budget: AsyncMock) -> None:
+    mock_claude.classify.return_value = _claude_result()
+    engine = TriageEngine(claude_classifier=mock_claude, llm_budget=mock_budget)
+
+    await engine.classify_with_fallback(_issue(title="something happened"), config={}, repo_id=111, event_id="e1")
+
+    mock_claude.classify.assert_awaited_once()
+    assert mock_claude.classify.call_args.kwargs == {"event_id": "e1"}
+    mock_budget.record.assert_awaited_once_with(ok=True)
+
+
+@pytest.mark.parametrize("failure", [None, RuntimeError("boom")])
+async def test_failed_claude_call_is_recorded_as_failure(
+    mock_claude: AsyncMock, mock_budget: AsyncMock, failure: object
+) -> None:
+    if isinstance(failure, Exception):
+        mock_claude.classify.side_effect = failure
+    else:
+        mock_claude.classify.return_value = failure
+    engine = TriageEngine(claude_classifier=mock_claude, llm_budget=mock_budget)
+
+    result = await engine.classify_with_fallback(_issue(title="something happened"), config={}, repo_id=111)
+
+    mock_budget.record.assert_awaited_once_with(ok=False)
+    assert result.engine_version == FALLBACK_ENGINE_VERSION
+
+
+async def test_claude_p0_is_capped_at_p1_with_note(mock_claude: AsyncMock) -> None:
+    mock_claude.classify.return_value = _claude_result(priority="P0")
+    engine = TriageEngine(claude_classifier=mock_claude)
+
+    result = await engine.classify_with_fallback(_issue(title="something happened"), config={})
+
+    assert result.priority == "P1"
+    assert result.category == "security"
+    assert result.engine_version == CLAUDE_ENGINE_VERSION
+    assert result.note is not None
+    assert "capped at P1" in result.note
+    assert "P0" in result.note
+
+
+@pytest.mark.parametrize("priority", ["P1", "P2", "P3"])
+async def test_claude_priority_at_or_below_ceiling_is_untouched(mock_claude: AsyncMock, priority: str) -> None:
+    mock_claude.classify.return_value = _claude_result(priority=priority)
+    engine = TriageEngine(claude_classifier=mock_claude)
+
+    result = await engine.classify_with_fallback(_issue(title="something happened"), config={})
+
+    assert result.priority == priority
+    assert result.note is None
+
+
+async def test_ceiling_is_configurable(mock_claude: AsyncMock) -> None:
+    mock_claude.classify.return_value = _claude_result(priority="P1")
+    engine = TriageEngine(claude_classifier=mock_claude, claude_max_priority="P2")
+
+    result = await engine.classify_with_fallback(_issue(title="something happened"), config={})
+
+    assert result.priority == "P2"
+
+
+async def test_ceiling_p0_disables_capping(mock_claude: AsyncMock) -> None:
+    mock_claude.classify.return_value = _claude_result(priority="P0")
+    engine = TriageEngine(claude_classifier=mock_claude, claude_max_priority="P0")
+
+    result = await engine.classify_with_fallback(_issue(title="something happened"), config={})
+
+    assert result.priority == "P0"
+    assert result.note is None
+
+
+async def test_rule_engine_p0_is_never_capped(mock_claude: AsyncMock) -> None:
+    engine = TriageEngine(claude_classifier=mock_claude)
+    result = await engine.classify_with_fallback(_issue(title="issue", labels=["bug", "p0"]), config={})
+
+    mock_claude.classify.assert_not_called()
+    assert result.priority == "P0"
+    assert result.engine_version == ENGINE_VERSION
+
+
+def test_invalid_ceiling_is_rejected() -> None:
+    with pytest.raises(ValueError):
+        TriageEngine(claude_max_priority="P9")

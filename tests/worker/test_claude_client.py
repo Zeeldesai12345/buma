@@ -37,7 +37,7 @@ def _issue(
 
 def _tool_response(input_data: dict) -> SimpleNamespace:
     """Build a fake anthropic.types.Message with a single tool_use content block."""
-    block = SimpleNamespace(type="tool_use", input=input_data)
+    block = SimpleNamespace(type="tool_use", name="classify_issue", input=input_data)
     return SimpleNamespace(content=[block])
 
 

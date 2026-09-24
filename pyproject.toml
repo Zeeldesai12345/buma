@@ -49,6 +49,11 @@ line-length = 120
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Live evals call the real Anthropic API (costs money) — excluded by default; run with `pytest -m live -s`.
+addopts = "-m 'not live'"
+markers = [
+    "live: calls the real Anthropic API; manual/nightly only, skipped without ANTHROPIC_API_KEY",
+]
 
 [build-system]
 requires = ["setuptools"]
