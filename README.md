@@ -7,7 +7,7 @@
 ![FastAPI](https://img.shields.io/badge/FastAPI-async%20gateway-009688)
 ![React](https://img.shields.io/badge/React-19-61DAFB)
 ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED)
-![Tests](https://img.shields.io/badge/tests-294%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-314%20passing-brightgreen)
 ![Coverage](https://img.shields.io/badge/coverage-≥80%25%20gated-brightgreen)
 
 Every new GitHub issue is a small decision problem: what kind of bug is this, how urgent is it, and who on the team should own it? buma answers that automatically — the moment an issue is opened, it classifies it, scores its priority, picks the best-fit developer by skills and current workload, and writes an auditable explanation straight into the GitHub issue thread. No human touches the triage backlog unless the rules say they should.
@@ -24,6 +24,7 @@ This isn't a script that calls the GitHub API — it's a small distributed syste
 - **Every automated decision is explainable and reversible.** Each triage run writes a decision log row *and* posts a human-readable comment on the issue — category, priority, and why a specific developer was chosen. Nothing is a black box.
 - **Security is not an afterthought.** Webhook deliveries are HMAC-signature verified before anything touches the queue; the dashboard uses real GitHub OAuth 2.0 session auth, not a shared password.
 - **Idempotent by design.** Webhook deliveries are deduplicated and retried safely — reprocessing the same event twice never double-assigns or double-comments.
+- **Rule-based first, LLM as a bounded safety net.** Classification runs through deterministic rules by default; only when confidence is low does it optionally consult the Claude API for a second opinion, and any timeout, invalid response, or outage falls back to the rule result automatically — no single point of failure, no unbounded LLM dependency.
 - **Tested like it matters.** 294 tests across gateway, worker, and schemas, with an 80% coverage gate enforced in CI on every PR — not just a `pytest` folder that exists for show.
 - **Documented for a stranger to pick up.** Numbered design decisions (`docs/worker-design.md`), a full setup walkthrough (`docs/user-guide.md`), and a 10-scenario UAT script with sign-off tables (`docs/uat.md`) — the kind of documentation a real engineering org expects before something ships.
 
@@ -41,7 +42,7 @@ This isn't a script that calls the GitHub API — it's a small distributed syste
                                    ┌──────────────────┐
                                    │   Triage Worker   │  async, graceful shutdown
                                    │  ───────────────  │
-                                   │  1. Classify      │  category + priority rules
+                                   │  1. Classify      │  rules first, optional Claude fallback
                                    │  2. Assign        │  skills + capacity + tie-break
                                    │  3. Persist        │  decision log (Postgres)
                                    │  4. Patch GitHub  │  labels, assignee, comment
@@ -64,6 +65,7 @@ The queue absorbs bursts and enables retries without dropping events; the decisi
 | Webhook gateway | FastAPI, async, HMAC-signed webhook validation, GitHub OAuth 2.0 |
 | Triage worker | Python asyncio, Redis-backed queue consumer, graceful signal-based shutdown |
 | Data layer | PostgreSQL, SQLAlchemy 2.0 ORM, Alembic migrations |
+| Hybrid classification (optional) | Anthropic Claude API via the official `anthropic` SDK — consulted only when rule-based confidence is below a threshold |
 | Dashboard | React 19, MUI, Recharts, React Router, Axios |
 | Testing | pytest, pytest-asyncio, pytest-cov (80% gate), respx (HTTP mocking) |
 | Tooling | uv, ruff, black, Docker Compose, VS Code Dev Containers |
@@ -76,7 +78,7 @@ The queue absorbs bursts and enables retries without dropping events; the decisi
 The full backend pipeline is implemented and end-to-end smoke-tested:
 
 - **Gateway** (`src/buma/gateway/`) — webhook ingest, HMAC validation, Redis publish; dashboard config + observability API; GitHub OAuth 2.0 login + session auth
-- **Worker** (`src/buma/worker/`) — queue consumer, triage engine, assignee selector, DB persistence, GitHub patch (labels + assignee + comment)
+- **Worker** (`src/buma/worker/`) — queue consumer, triage engine (rule-based, with an optional low-confidence Claude API fallback), assignee selector, DB persistence, GitHub patch (labels + assignee + comment)
 - **Database** (`src/buma/db/`) — 6 ORM models, Alembic migrations applied
 - **API schemas** (`src/buma/schemas/api/`) — typed request/response contracts for all `/api/*` routes
 - **Dashboard** (`web-dashboard/`) — React app for configuration, triage history, and workload visibility
@@ -97,6 +99,8 @@ docker compose up
 ```
 
 Docker Compose brings up Postgres and Redis, runs Alembic migrations, then starts the gateway and worker in the right order. See the [User Guide](docs/user-guide.md) for the full walkthrough — GitHub App + OAuth App setup, `ngrok` tunneling, and enrolling your first repo.
+
+**Optional — hybrid Claude fallback:** set `ANTHROPIC_API_KEY` in `.env` to let the worker consult Claude for issues the rule engine classifies with low confidence (see [DD-23](docs/worker-design.md#dd-23--hybrid-claude-api-fallback-for-low-confidence-classifications)). Leave it unset and triage stays 100% rule-based, exactly as before.
 
 <details>
 <summary><strong>Host-mode dev (infra in Docker, services on your machine)</strong></summary>
@@ -160,7 +164,7 @@ src/buma/
 └── worker/         async queue consumer + triage pipeline
 
 web-dashboard/       React 19 + MUI + Recharts operator dashboard
-tests/                mirrors src/buma/, 294 tests
+tests/                mirrors src/buma/, 314 tests
 migrations/           Alembic migrations
 scripts/               lint, test, codegen, smoke test
 docs/

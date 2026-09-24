@@ -99,3 +99,34 @@ Phase 4: assignee selection (skills + capacity + optimistic locking on Developer
 Phase 5: persist IssueSnapshot + TriageDecision
 Phase 6: GitHub patch (labels, assignee, explanation comment)
 ```
+
+---
+
+## DD-23 — Hybrid Claude API fallback for low-confidence classifications
+
+**Decision:** `TriageEngine.classify()` (deterministic, rule-based) always runs first and is unchanged. A new async `TriageEngine.classify_with_fallback()` wraps it: if the rule result's `confidence` is below `confidence_threshold` (default `0.5`, env `CLAUDE_CONFIDENCE_THRESHOLD`) **and** an `ANTHROPIC_API_KEY` is configured, it consults `ClaudeClassifier` (`src/buma/worker/services/claude_client.py`) for a second opinion. Claude is forced (via `tool_choice`) to respond with a structured `classify_issue` tool call constrained to the same category/priority enums the rule engine uses, so its answer can be validated the same way rule output already is.
+
+**Choice made:** Rules-first, Claude as an optional low-confidence fallback — never the reverse.
+
+**Alternatives considered:**
+
+| | Rules-first, Claude fallback (chosen) | Claude-first, rules as fallback | Claude replaces rules entirely |
+|---|---|---|---|
+| Cost | One paid API call only on ambiguous issues | A paid API call on every issue | A paid API call on every issue |
+| Availability | A Claude outage never blocks triage — rules always answer | An outage degrades every issue, not just ambiguous ones | An outage stops triage entirely |
+| Determinism | Clear, obvious issues stay 100% deterministic and free | Non-deterministic even for obvious cases | Fully non-deterministic |
+| Explainability | `engine_version` records exactly which path answered | Same, but the "normal" path is now the black box | No rule-based baseline left to compare against |
+
+**Reasoning:**
+
+Section 1 of `docs/claude.md` requires triage decisions to stay explainable and traceable, and explicitly says not to replace rule-based triage with LLM-based triage unless requested. Consulting Claude only when the rule engine itself reports low confidence keeps the common case (clear labels, obvious keywords) fast, free, and fully deterministic, and bounds the blast radius of an LLM outage or bad response to the already-ambiguous minority of issues — exactly where a second opinion is most useful anyway.
+
+**Failure handling:** `ClaudeClassifier.classify()` never raises — any timeout (`CLAUDE_TIMEOUT_SECONDS`, default `8s`), connection error, non-2xx response, or invalid/out-of-enum category, priority, or confidence value is caught and logged, and `classify_with_fallback()` falls back to the original rule result. `TriageResult.engine_version` distinguishes all three outcomes:
+
+| `engine_version` | Meaning |
+|---|---|
+| `rules-v1` | Rule confidence was already high enough — Claude was never called |
+| `claude-hybrid-v1` | Rule confidence was low; Claude answered and its response passed validation |
+| `rules-v1-fallback` | Rule confidence was low; Claude was attempted but failed/timed out/returned invalid data — the rule result was used anyway |
+
+No database migration was required — `engine_version` is an existing string column on `TriageDecision`; the new values are just additional strings it can hold.

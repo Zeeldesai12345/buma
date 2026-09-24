@@ -2,17 +2,27 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from buma.schemas.normalized_event import IssueRef
 from buma.worker.services.category_rules import CATEGORY_KEYWORD_MAP, CATEGORY_LABEL_MAP
 from buma.worker.services.priority_rules import PRIORITY_KEYWORDS, PRIORITY_LABEL_MAP, PRIORITY_ORDER
 
+if TYPE_CHECKING:
+    from buma.worker.services.claude_client import ClaudeClassifier
+
 logger = logging.getLogger(__name__)
 
 ENGINE_VERSION = "rules-v1"
+# Claude answered and its response passed validation.
+CLAUDE_ENGINE_VERSION = "claude-hybrid-v1"
+# Rule confidence was low and Claude was attempted but failed/timed out/returned invalid data —
+# the rule result was used anyway.
+FALLBACK_ENGINE_VERSION = "rules-v1-fallback"
 
 DEFAULT_CATEGORY = "bug"
 DEFAULT_PRIORITY = "P2"
+DEFAULT_CONFIDENCE_THRESHOLD = 0.5
 
 
 @dataclass(frozen=True)
@@ -28,9 +38,22 @@ class TriageEngine:
     Classifies a GitHub issue into a category and priority using
     deterministic rules (label matching → keyword matching → fallback).
 
-    Pure logic — no I/O, no DB, no async.
-    Rules are defined in category_rules.py and priority_rules.py.
+    `classify()` is pure logic — no I/O, no DB, no async. Rules are defined in
+    category_rules.py and priority_rules.py.
+
+    `classify_with_fallback()` layers an optional hybrid step on top: when the rule result's
+    confidence is below `confidence_threshold`, it asks the injected `ClaudeClassifier` to
+    classify instead. If no classifier is configured, or Claude fails/times out/returns invalid
+    data, it always falls back to the rule result — this method never raises.
     """
+
+    def __init__(
+        self,
+        claude_classifier: ClaudeClassifier | None = None,
+        confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    ) -> None:
+        self._claude_classifier = claude_classifier
+        self._confidence_threshold = confidence_threshold
 
     def classify(self, issue: IssueRef, config: dict) -> TriageResult:
         text = self._build_text(issue.title, issue.body)
@@ -54,6 +77,46 @@ class TriageEngine:
             confidence=confidence,
             engine_version=ENGINE_VERSION,
         )
+
+    async def classify_with_fallback(self, issue: IssueRef, config: dict) -> TriageResult:
+        """
+        Rule-based classification first; consult Claude only when confidence is low.
+
+        Never raises: any exception from the Claude classifier is caught here as a second
+        safety net (the classifier's own `classify()` is already expected not to raise), and
+        the rule-based result is returned instead.
+        """
+        rule_result = self.classify(issue, config)
+
+        if self._claude_classifier is None or rule_result.confidence >= self._confidence_threshold:
+            return rule_result
+
+        try:
+            claude_result = await self._claude_classifier.classify(issue)
+        except Exception:
+            logger.exception("Claude classifier raised unexpectedly — falling back to rule result")
+            claude_result = None
+
+        if claude_result is None:
+            logger.info(
+                "Claude fallback unavailable/invalid (rule confidence=%.2f) — using rule result",
+                rule_result.confidence,
+            )
+            return TriageResult(
+                category=rule_result.category,
+                priority=rule_result.priority,
+                confidence=rule_result.confidence,
+                engine_version=FALLBACK_ENGINE_VERSION,
+            )
+
+        logger.info(
+            "Claude fallback used: rule confidence=%.2f -> category=%s priority=%s claude_confidence=%.2f",
+            rule_result.confidence,
+            claude_result.category,
+            claude_result.priority,
+            claude_result.confidence,
+        )
+        return claude_result
 
     def _classify_category(self, labels: list[str], text: str, config: dict) -> tuple[str, float]:
         label_map = self._merge_maps(CATEGORY_LABEL_MAP, config.get("label_map", {}).get("categories", {}))
