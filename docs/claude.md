@@ -85,7 +85,9 @@ tests/
 ├── core/
 ├── gateway/
 ├── schemas/
-└── worker/
+├── worker/
+├── eval/       # live evals against the real Claude API (marked `live`)
+└── fixtures/   # eval data, e.g. injection_attempts.json
 ```
 
 ## Frontend
@@ -261,12 +263,46 @@ invalid/out-of-range category, priority, or confidence value) is caught and
 logged, and the original rule result is used instead — this path never
 raises and never blocks the pipeline. `TriageDecision.explanation` and the
 `TriageResult.engine_version` field always record which path actually
-answered: `rules-v1`, `claude-hybrid-v1`, or `rules-v1-fallback`. See
+answered: `rules-v1`, `claude-hybrid-v1`, `rules-v1-fallback`, or
+`rules-v1-budget` (Claude skipped by the cost gate). See
 [DD-23 in Worker Design](worker-design.md#dd-23--hybrid-claude-api-fallback-for-low-confidence-classifications)
 for the full rationale.
 
 If `ANTHROPIC_API_KEY` is not set, this path is skipped entirely and triage
 behaves exactly as it did before this feature existed.
+
+#### Claude Guardrails
+
+Issue titles, bodies, and labels are written by arbitrary GitHub users and
+must be treated as untrusted input on the Claude path. Four independent
+layers protect it (see
+[DD-24 in Worker Design](worker-design.md#dd-24--prompt-injection-guardrail-and-cost-limits-on-the-claude-path)):
+
+1. **Input hardening** (`claude_client.py`) — body truncated at
+   `CLAUDE_MAX_BODY_CHARS`; issue wrapped in `<untrusted_issue>` tags that
+   the input cannot open or close; system prompt says tagged content is data,
+   never instructions. `PROMPT_VERSION` identifies the prompt.
+2. **Cost gate** (`llm_budget.py`, Redis) — per-repo daily call budget
+   (`CLAUDE_DAILY_CALL_LIMIT_PER_REPO`) and a circuit breaker
+   (`CLAUDE_BREAKER_THRESHOLD`, `CLAUDE_BREAKER_COOLDOWN_SECONDS`). Fails
+   closed if Redis errors.
+3. **Output validation** (`_parse_response`) — tool name, enum values,
+   field types, and confidence range are all checked before the answer is used.
+4. **Severity ceiling** (`TriageEngine`) — a Claude-only priority more severe
+   than `CLAUDE_MAX_PRIORITY` (default `P1`) is capped, with a note in the
+   GitHub comment. Rule-engine priorities are never capped.
+
+When changing the Claude path:
+
+- Do not weaken or remove any of these layers without explicit approval.
+- Bump `PROMPT_VERSION` whenever `_SYSTEM_PROMPT`, `_build_prompt`, or the
+  tool schema changes.
+- Never post model-generated free text (e.g. a `reasoning` field) to GitHub
+  without first stripping `@mentions`, links, and images, capping its
+  length, and labelling it as AI-generated. `TriageResult.note` must only
+  ever contain text written by buma's own code.
+- Add a hostile case to `tests/worker/test_claude_parse_guardrail.py` for
+  any new field the model can return.
 
 ### Gateway and Worker Separation
 
@@ -318,7 +354,9 @@ tests/
 ├── core/
 ├── gateway/
 ├── schemas/
-└── worker/
+├── worker/
+├── eval/       # live evals against the real Claude API (marked `live`)
+└── fixtures/   # eval data, e.g. injection_attempts.json
 ```
 
 When behavior changes:
@@ -333,6 +371,11 @@ Smoke-test functionality is located under:
 ```text
 scripts/smoke/
 ```
+
+Tests marked `live` (under `tests/eval/`) call the real Anthropic API and
+cost money. They are excluded from the default run (`addopts` in
+`pyproject.toml`). Do not run them (`uv run pytest -m live -s tests/eval`)
+without the user's explicit approval.
 
 Never claim that a test passed unless it was actually executed.
 
