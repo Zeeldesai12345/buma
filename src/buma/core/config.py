@@ -30,6 +30,15 @@ class Settings(BaseSettings):
     # Never set to True in production.
     debug: bool = False
 
+    # === Claude API (hybrid triage fallback) ===
+    # Used only by the worker, and only when rule-based confidence is below
+    # claude_confidence_threshold. If unset, the hybrid path is disabled and
+    # triage stays 100% rule-based.
+    anthropic_api_key: str | None = None
+    claude_model: str = "claude-haiku-4-5-20251001"
+    claude_confidence_threshold: float = 0.5
+    claude_timeout_seconds: float = 8.0
+
 
 @lru_cache
 def get_settings() -> Settings:
