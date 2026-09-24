@@ -72,6 +72,7 @@ src/
 └── buma/
     ├── gateway/
     │   └── services/
+    ├── mcp_server/
     └── worker/
         └── services/
 ```
@@ -86,6 +87,7 @@ tests/
 ├── gateway/
 ├── schemas/
 ├── worker/
+├── mcp_server/   # MCP server via the SDK's in-memory client + stdio subprocess tests
 ├── integration/  # real Postgres + pgvector (marked `integration`)
 ├── eval/       # live evals against the real Claude API (marked `live`)
 └── fixtures/   # eval data, e.g. injection_attempts.json
@@ -159,6 +161,7 @@ Use the existing repository structure and inspect the actual files before assumi
 
 - Anthropic Claude API (`anthropic` Python SDK) — hybrid triage fallback
 - `fastembed` (local ONNX, CPU) + pgvector — semantic duplicate detection (worker only)
+- `mcp` (official MCP Python SDK, `MCPServer` — formerly `FastMCP`) — read-only stdio MCP server
   only, consulted below a confidence threshold. See Section 4.
 
 **Testing**
@@ -336,6 +339,38 @@ When changing this feature:
   the pure-Python `pgvector` package belongs there.
 - Changing `EMBEDDING_MODEL` requires re-running the backfill with `--force`.
 
+### MCP Server (N1, read-only)
+
+`src/buma/mcp_server/` is a **stdio** MCP server (`python -m buma.mcp_server`)
+built on the official MCP Python SDK. In `mcp` 2.x the SDK's `FastMCP` class
+is named `MCPServer`. See
+[DD-26 in Worker Design](worker-design.md#dd-26--read-only-mcp-server-over-buma-data-stdio).
+
+- Tools: `get_triage_history(repo_id, limit=20)` (limit 1–50) and
+  `get_workload(repo_id)`. Resource: `buma://repos`.
+- All data access goes through
+  `src/buma/gateway/services/observability_queries.py`, shared with the REST
+  observability routes. Never copy SQL into a route or an MCP tool.
+- Configuration is `BUMA_MCP_DATABASE_URL` only (falls back to
+  `DATABASE_URL`). It deliberately does not use `buma.core.config.Settings`.
+
+When changing the MCP server:
+
+- **Never add a tool, resource, or prompt that writes, configures, or
+  triggers anything.** Every tool must carry `readOnlyHint=True`.
+- Keep the database session read-only
+  (`default_transaction_read_only=on` in `mcp_server/db.py`).
+- Return GitHub-authored or GitHub-derived text only through
+  `untrusted_text()` in an `untrusted_*` field, with `DATA_NOTICE` in the
+  payload. Never return issue bodies.
+- Never return secrets, database URLs, installation IDs, or repo
+  configuration. Raise `ToolError` with a generic message for database
+  errors.
+- Never write to stdout — it carries the MCP protocol. Log to stderr.
+- Do not import worker, Claude, GitHub, or embedding code into the server.
+- The Streamable HTTP transport, OAuth, and `get_llm_usage` (needs T5) are
+  not implemented; do not document them as available.
+
 ### Gateway and Worker Separation
 
 Keep Gateway and Worker responsibilities separate.
@@ -387,6 +422,7 @@ tests/
 ├── gateway/
 ├── schemas/
 ├── worker/
+├── mcp_server/   # MCP server via the SDK's in-memory client + stdio subprocess tests
 ├── integration/  # real Postgres + pgvector (marked `integration`)
 ├── eval/       # live evals against the real Claude API (marked `live`)
 └── fixtures/   # eval data, e.g. injection_attempts.json
