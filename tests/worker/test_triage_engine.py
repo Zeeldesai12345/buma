@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from unittest.mock import AsyncMock
 
 import pytest
 
 from buma.schemas.normalized_event import IssueRef
-from buma.worker.services.triage_engine import ENGINE_VERSION, TriageEngine, TriageResult
+from buma.worker.services.triage_engine import (
+    CLAUDE_ENGINE_VERSION,
+    ENGINE_VERSION,
+    FALLBACK_ENGINE_VERSION,
+    TriageEngine,
+    TriageResult,
+)
 
 RECEIVED_AT = datetime(2024, 1, 1, tzinfo=UTC)
 
@@ -262,3 +269,88 @@ def test_overall_confidence_ignores_fallback_zero(engine: TriageEngine) -> None:
 def test_engine_version_in_result(engine: TriageEngine) -> None:
     result = engine.classify(_issue(title="crash"), config={})
     assert result.engine_version == ENGINE_VERSION
+
+
+# ---------------------------------------------------------------------------
+# Hybrid Claude fallback — classify_with_fallback()
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def mock_claude() -> AsyncMock:
+    return AsyncMock()
+
+
+def _claude_result(confidence: float = 0.8) -> TriageResult:
+    return TriageResult(category="security", priority="P0", confidence=confidence, engine_version=CLAUDE_ENGINE_VERSION)
+
+
+async def test_no_classifier_configured_behaves_like_rules_only() -> None:
+    engine = TriageEngine(claude_classifier=None)
+    result = await engine.classify_with_fallback(_issue(title="something happened"), config={})
+    assert result.engine_version == ENGINE_VERSION
+    assert result.confidence == 0.0
+
+
+async def test_high_confidence_skips_claude(mock_claude: AsyncMock) -> None:
+    engine = TriageEngine(claude_classifier=mock_claude, confidence_threshold=0.5)
+    result = await engine.classify_with_fallback(_issue(title="issue", labels=["bug"]), config={})
+
+    mock_claude.classify.assert_not_called()
+    assert result.engine_version == ENGINE_VERSION
+    assert result.category == "bug"
+    assert result.confidence == 1.0
+
+
+async def test_low_confidence_triggers_claude_call(mock_claude: AsyncMock) -> None:
+    mock_claude.classify.return_value = _claude_result()
+    engine = TriageEngine(claude_classifier=mock_claude, confidence_threshold=0.5)
+
+    issue = _issue(title="something happened")  # confidence 0.0 -> below threshold
+    await engine.classify_with_fallback(issue, config={})
+
+    mock_claude.classify.assert_called_once_with(issue)
+
+
+async def test_successful_claude_response_is_used(mock_claude: AsyncMock) -> None:
+    mock_claude.classify.return_value = _claude_result(confidence=0.8)
+    engine = TriageEngine(claude_classifier=mock_claude, confidence_threshold=0.5)
+
+    result = await engine.classify_with_fallback(_issue(title="something happened"), config={})
+
+    assert result.category == "security"
+    assert result.priority == "P0"
+    assert result.confidence == 0.8
+    assert result.engine_version == CLAUDE_ENGINE_VERSION
+
+
+async def test_invalid_claude_response_falls_back_to_rules(mock_claude: AsyncMock) -> None:
+    mock_claude.classify.return_value = None  # ClaudeClassifier's own contract on invalid data
+    engine = TriageEngine(claude_classifier=mock_claude, confidence_threshold=0.5)
+
+    result = await engine.classify_with_fallback(_issue(title="something happened"), config={})
+
+    assert result.category == "bug"  # rule fallback default
+    assert result.priority == "P2"
+    assert result.engine_version == FALLBACK_ENGINE_VERSION
+
+
+async def test_claude_api_failure_falls_back_to_rules(mock_claude: AsyncMock) -> None:
+    mock_claude.classify.side_effect = RuntimeError("Claude API unavailable")
+    engine = TriageEngine(claude_classifier=mock_claude, confidence_threshold=0.5)
+
+    result = await engine.classify_with_fallback(_issue(title="something happened"), config={})
+
+    assert result.category == "bug"
+    assert result.engine_version == FALLBACK_ENGINE_VERSION
+
+
+async def test_claude_fallback_preserves_rule_confidence_on_failure(mock_claude: AsyncMock) -> None:
+    mock_claude.classify.return_value = None
+    engine = TriageEngine(claude_classifier=mock_claude, confidence_threshold=0.9)
+
+    # Medium-confidence keyword match (0.7) is still below a 0.9 threshold.
+    result = await engine.classify_with_fallback(_issue(title="response is slow under load"), config={})
+
+    assert result.confidence == pytest.approx(0.7)
+    assert result.engine_version == FALLBACK_ENGINE_VERSION
