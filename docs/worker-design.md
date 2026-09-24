@@ -180,3 +180,37 @@ No database migration was required — `engine_version` is an existing string co
 **Known limits:** only `opened`/`closed` are ingested, so edited titles aren't re-embedded and reopened issues stay `closed`. HNSW filters after the index search, so a small repo among many large ones could get fewer than k results (fix: raise `hnsw.ef_search` or partition per repo). Changing `EMBEDDING_MODEL` requires `backfill --force`, because vectors from different models aren't comparable (queries filter on `model_version`).
 
 **Dev database:** the `db` image changed from `postgres:16-alpine` to `pgvector/pgvector:pg16` (Debian). Text collation differs between musl and glibc, so the dev volume was recreated with `docker compose down -v`, not reused.
+
+---
+
+## DD-26 — Read-only MCP server over Buma data (stdio)
+
+**Decision:** `src/buma/mcp_server/` exposes Buma's read-only observability data to MCP clients (Claude Code, Claude Desktop) over **stdio**, using the official MCP Python SDK's high-level server. In `mcp` 2.x that class is `MCPServer` (`from mcp.server.mcpserver import MCPServer`); it was called `FastMCP` in 1.x, and the old import path now raises an error pointing at the rename. Run it with `python -m buma.mcp_server`.
+
+**Surface — deliberately minimal:**
+
+| Kind | Name | Notes |
+|---|---|---|
+| Tool | `get_triage_history(repo_id, limit=20)` | `limit` 1–50. Returns decisions newest first plus the repo's total; issue title and explanation as `untrusted_issue_title` / `untrusted_explanation`; `data_notice` in every payload. Issue bodies are never returned |
+| Tool | `get_workload(repo_id)` | Open assignments, capacity, available capacity, skills (capped), totals |
+| Resource | `buma://repos` | `repo_id`, `repo_full_name`, `enrolled_at` only — no installation IDs or configuration |
+
+Repo discovery is a **resource**, not a tool: the client application decides when to attach it, while tools are invoked by the model. An unknown `repo_id` returns a tool error that points at `buma://repos`.
+
+**One query path:** the four observability REST routes and the MCP tools call the same functions in `gateway/services/observability_queries.py`. The REST routes kept their exact response shapes, and their existing tests pass unchanged.
+
+**Read-only, in layers:**
+1. Only read tools are registered (a test pins the exact tool list and forbids prompts), each annotated `readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False`.
+2. The server's database connections set `default_transaction_read_only=on`, so Postgres itself rejects any INSERT/UPDATE/DELETE (verified against real Postgres), plus `statement_timeout=5s` and `connect_timeout=5s`.
+3. The shared query module contains only SELECTs (a test scans it for write statements).
+4. Next step, not done: a dedicated read-only Postgres role.
+
+**Untrusted content:** issue titles and explanations are GitHub-authored or derived from GitHub text, and through MCP they land inside another model's context — an indirect prompt-injection path. They are returned only as `{text, truncated}` in `untrusted_*` fields, with control, zero-width and bidi-override characters stripped, titles flattened to one line and cut at 200 characters, explanations cut at 500, and a `data_notice` in the payload and in the server instructions. This lowers the odds that a client model follows injected text; the hard guarantee is that no write-capable tool exists.
+
+**Secrets:** the server reads only `BUMA_MCP_DATABASE_URL` (falling back to `DATABASE_URL`) through its own `MCPSettings`, never `buma.core.config.Settings`, so the GitHub App key, webhook secret and Anthropic key are never loaded. Database errors become a generic `ToolError`; unexpected exceptions reach the client only as `Error executing tool <name>` (SDK behaviour). The server imports no worker, Claude, GitHub or embedding code (tested in a subprocess).
+
+**stdio specifics:** stdout carries only protocol messages — logging goes to stderr, reconfigured to UTF-8 so Windows clients can decode it. On Windows, `__main__` runs the server on a `SelectorEventLoop`, because psycopg's async driver refuses the default `ProactorEventLoop`.
+
+**Auth:** stdio has no auth layer; the server runs as the local user with whatever database credentials that user supplies (the same trust level as `psql`).
+
+**Not implemented:** the Streamable HTTP transport and OAuth. The REST API's `require_session` Bearer JWT would be a pragmatic first step for HTTP, but it is not the MCP spec's OAuth 2.1 authorization model, and the REST API itself has no per-repo authorization. `get_llm_usage` is deferred until T5 adds the `llm_calls` table (today `engine_version` is not even a column).
