@@ -53,6 +53,22 @@ class Settings(BaseSettings):
     # Most severe priority a Claude-only answer may set. Rule-engine priorities are never capped.
     claude_max_priority: str = "P1"
 
+    # === Semantic duplicate detection (T3 / DD-25) ===
+    # Worker-only. Every opened issue in an enrolled repo is embedded locally (CPU, fastembed)
+    # and stored in issue_embeddings. If the model fails to load, the feature is disabled and
+    # triage continues unchanged.
+    embedding_enabled: bool = True
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    # Issue body is cut to this many characters before embedding (the model truncates at 512 tokens anyway).
+    embedding_max_chars: int = 2000
+    # Where fastembed caches model files. The Docker image bakes the model into /opt/fastembed_cache.
+    embedding_cache_dir: str | None = None
+    duplicate_top_k: int = 5
+    # PROVISIONAL — not yet chosen from a labelled eval. Only used when duplicate_comment_enabled is true.
+    duplicate_similarity_threshold: float = 0.9
+    # Keep false until the threshold has been chosen from measured precision/recall.
+    duplicate_comment_enabled: bool = False
+
 
 @lru_cache
 def get_settings() -> Settings:

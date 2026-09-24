@@ -2,7 +2,9 @@ version: '3.8'
 
 services:
   db:
-    image: postgres:16-alpine
+    # pgvector build of Postgres 16 (Debian-based) — required for the issue_embeddings table (T3 / DD-25).
+    # Switching from postgres:16-alpine requires recreating the dev volume: `docker compose down -v`.
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
