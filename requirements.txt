@@ -4,6 +4,9 @@
 cryptography==46.0.5
 fastapi==0.133.1
 httpx==0.28.1
+# pgvector: pure-Python SQLAlchemy Vector type, needed because the gateway imports buma.db.models.
+# fastembed/onnxruntime are worker-only and intentionally NOT listed here.
+pgvector==0.5.0
 psycopg[binary]==3.3.3
 pydantic==2.12.5
 pydantic-settings==2.13.1

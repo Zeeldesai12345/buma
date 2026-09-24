@@ -25,7 +25,8 @@ This isn't a script that calls the GitHub API — it's a small distributed syste
 - **Security is not an afterthought.** Webhook deliveries are HMAC-signature verified before anything touches the queue; the dashboard uses real GitHub OAuth 2.0 session auth, not a shared password.
 - **Idempotent by design.** Webhook deliveries are deduplicated and retried safely — reprocessing the same event twice never double-assigns or double-comments.
 - **Rule-based first, LLM as a bounded safety net.** Classification runs through deterministic rules by default; only when confidence is low does it optionally consult the Claude API for a second opinion, and any timeout, invalid response, or outage falls back to the rule result automatically — no single point of failure, no unbounded LLM dependency. Issue text is treated as untrusted input: it is truncated and fenced off from instructions, Claude's output is schema-checked, a Claude-only answer can never raise a P0, and a per-repo daily budget plus a circuit breaker cap API spend.
-- **Tested like it matters.** 377 tests across gateway, worker, and schemas, with an 80% coverage gate enforced in CI on every PR — plus a deterministic red-team suite for hostile model output and a separate live prompt-injection eval.
+- **Semantic duplicate detection, at zero API cost.** Every opened issue is embedded locally (`fastembed`, `bge-small-en-v1.5`, CPU) and indexed in Postgres with pgvector, so the worker can find the most similar issues in the same repo. Matches are only ever flagged, never auto-closed. Posting them is switched off until the similarity threshold has been chosen from a labelled eval.
+- **Tested like it matters.** 419 tests across gateway, worker, and schemas, with an 80% coverage gate enforced in CI on every PR — plus a deterministic red-team suite for hostile model output, opt-in pgvector integration tests, and a separate live prompt-injection eval.
 - **Documented for a stranger to pick up.** Numbered design decisions (`docs/worker-design.md`), a full setup walkthrough (`docs/user-guide.md`), and a 10-scenario UAT script with sign-off tables (`docs/uat.md`) — the kind of documentation a real engineering org expects before something ships.
 
 ---
@@ -102,6 +103,8 @@ Docker Compose brings up Postgres and Redis, runs Alembic migrations, then start
 
 **Optional — hybrid Claude fallback:** set `ANTHROPIC_API_KEY` in `.env` to let the worker consult Claude for issues the rule engine classifies with low confidence (see [DD-23](docs/worker-design.md#dd-23--hybrid-claude-api-fallback-for-low-confidence-classifications)). Leave it unset and triage stays 100% rule-based, exactly as before. The Claude path is guarded against prompt injection and runaway cost (see [DD-24](docs/worker-design.md#dd-24--prompt-injection-guardrail-and-cost-limits-on-the-claude-path)); the limits — `CLAUDE_MAX_BODY_CHARS`, `CLAUDE_DAILY_CALL_LIMIT_PER_REPO`, `CLAUDE_BREAKER_THRESHOLD`, `CLAUDE_BREAKER_COOLDOWN_SECONDS`, `CLAUDE_MAX_PRIORITY` — are documented in `.env.example`.
 
+**Semantic duplicate detection** is on by default and needs no API key: the worker embeds every opened issue locally and stores it in pgvector (see [DD-25](docs/worker-design.md#dd-25--semantic-duplicate-detection-with-local-embeddings-and-pgvector)). The `db` service now uses `pgvector/pgvector:pg16`. **If you have an existing dev volume from the old `postgres:16-alpine` image, recreate it** with `docker compose down -v` before `docker compose up`, because the Alpine and Debian images sort text differently. To index issues that existed before enrollment, run `docker compose run --rm worker uv run --no-sync python -m buma.worker.backfill_embeddings` (safe to re-run). `DUPLICATE_COMMENT_ENABLED` stays `false` until the similarity threshold has been chosen from a labelled eval.
+
 <details>
 <summary><strong>Host-mode dev (infra in Docker, services on your machine)</strong></summary>
 
@@ -164,13 +167,13 @@ src/buma/
 └── worker/         async queue consumer + triage pipeline
 
 web-dashboard/       React 19 + MUI + Recharts operator dashboard
-tests/                mirrors src/buma/, 377 tests (+ live evals under tests/eval/)
+tests/                mirrors src/buma/, 419 tests (+ pgvector integration tests, live evals)
 migrations/           Alembic migrations
 scripts/               lint, test, codegen, smoke test
 docs/
 ├── user-guide.md     install + configure + run, end to end
 ├── uat.md              10-scenario UAT script with sign-off
-└── worker-design.md   numbered design decisions (DD-14…DD-24)
+└── worker-design.md   numbered design decisions (DD-14…DD-25)
 .github/workflows/    CI: lint + test on every PR
 .devcontainer/         reproducible VS Code dev environment
 ```

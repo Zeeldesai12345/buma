@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
@@ -130,6 +131,42 @@ class IssueSnapshot(Base):
             "repo_id",
             "issue_number",
             text("snapshot_at DESC"),
+        ),
+    )
+
+
+EMBEDDING_DIM = 384
+
+
+class IssueEmbedding(Base):
+    """
+    One embedding per issue (not per event) for semantic duplicate detection (T3 / DD-25).
+    Keyed by (repo_id, issue_number) so re-processing an issue overwrites its row instead of
+    creating a second vector that would match itself. `model_version` records which embedding
+    model produced the vector — vectors from different models are not comparable.
+    """
+
+    __tablename__ = "issue_embeddings"
+
+    repo_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("repo_config.repo_id", ondelete="CASCADE"), primary_key=True
+    )
+    issue_number: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIM), nullable=False)
+    model_version: Mapped[str] = mapped_column(Text, nullable=False)
+    issue_state: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'open'"))
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("issue_state IN ('open','closed')", name="issue_state"),
+        Index(
+            "ix_issue_embeddings_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
         ),
     )
 

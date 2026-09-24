@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import AsyncIterator
 
 import httpx
 import jwt
@@ -86,6 +87,32 @@ class GitHubClient:
                 json={"body": body},
             )
             response.raise_for_status()
+
+    async def list_issues(
+        self,
+        installation_token: str,
+        owner: str,
+        repo: str,
+        state: str = "all",
+        per_page: int = 100,
+    ) -> AsyncIterator[dict]:
+        """
+        Yield every issue in a repository, following `Link: rel="next"` pagination.
+
+        NOTE: GitHub's issues endpoint also returns pull requests (items with a `pull_request`
+        key). They are yielded as-is — callers that want issues only must filter them out.
+        """
+        url: str | None = f"{_GITHUB_API}/repos/{owner}/{repo}/issues"
+        params: dict | None = {"state": state, "per_page": per_page}
+        async with httpx.AsyncClient() as client:
+            while url:
+                response = await client.get(url, headers=self._token_headers(installation_token), params=params)
+                response.raise_for_status()
+                for item in response.json():
+                    yield item
+                # The "next" URL already carries the query string.
+                url = response.links.get("next", {}).get("url")
+                params = None
 
     # ------------------------------------------------------------------
     # Internals

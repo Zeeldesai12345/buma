@@ -40,3 +40,5 @@ coverage.xml
 
 # Docker
 *.log
+# fastembed model cache (host-mode runs)
+.fastembed_cache/
