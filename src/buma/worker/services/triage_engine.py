@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from buma.schemas.normalized_event import IssueRef
@@ -10,6 +10,7 @@ from buma.worker.services.priority_rules import PRIORITY_KEYWORDS, PRIORITY_LABE
 
 if TYPE_CHECKING:
     from buma.worker.services.claude_client import ClaudeClassifier
+    from buma.worker.services.llm_budget import LLMBudget
 
 logger = logging.getLogger(__name__)
 
@@ -19,10 +20,15 @@ CLAUDE_ENGINE_VERSION = "claude-hybrid-v1"
 # Rule confidence was low and Claude was attempted but failed/timed out/returned invalid data —
 # the rule result was used anyway.
 FALLBACK_ENGINE_VERSION = "rules-v1-fallback"
+# Rule confidence was low but Claude was skipped by the cost gate (daily budget exhausted or
+# circuit breaker open) — the rule result was used. Kept distinct from FALLBACK_ENGINE_VERSION
+# so "skipped over budget" and "Claude failed" can be counted separately.
+BUDGET_ENGINE_VERSION = "rules-v1-budget"
 
 DEFAULT_CATEGORY = "bug"
 DEFAULT_PRIORITY = "P2"
 DEFAULT_CONFIDENCE_THRESHOLD = 0.5
+DEFAULT_CLAUDE_MAX_PRIORITY = "P1"
 
 
 @dataclass(frozen=True)
@@ -31,6 +37,9 @@ class TriageResult:
     priority: str
     confidence: float
     engine_version: str
+    # Optional human-readable note appended to the GitHub explanation comment
+    # (e.g. when a Claude-suggested priority was capped).
+    note: str | None = None
 
 
 class TriageEngine:
@@ -45,15 +54,27 @@ class TriageEngine:
     confidence is below `confidence_threshold`, it asks the injected `ClaudeClassifier` to
     classify instead. If no classifier is configured, or Claude fails/times out/returns invalid
     data, it always falls back to the rule result — this method never raises.
+
+    Guardrails on the Claude path:
+    - `llm_budget` (optional) gates every Claude call on a per-repo daily budget and a circuit
+      breaker; a refused call returns the rule result with `BUDGET_ENGINE_VERSION`.
+    - `claude_max_priority` is a severity ceiling: a Claude-only answer more severe than it is
+      capped, because a valid-but-injected P0 would page people. Rule-engine results are never capped.
     """
 
     def __init__(
         self,
         claude_classifier: ClaudeClassifier | None = None,
         confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+        llm_budget: LLMBudget | None = None,
+        claude_max_priority: str = DEFAULT_CLAUDE_MAX_PRIORITY,
     ) -> None:
+        if claude_max_priority not in PRIORITY_ORDER:
+            raise ValueError(f"claude_max_priority must be one of {PRIORITY_ORDER}, got {claude_max_priority!r}")
         self._claude_classifier = claude_classifier
         self._confidence_threshold = confidence_threshold
+        self._llm_budget = llm_budget
+        self._claude_max_priority = claude_max_priority
 
     def classify(self, issue: IssueRef, config: dict) -> TriageResult:
         text = self._build_text(issue.title, issue.body)
@@ -78,7 +99,13 @@ class TriageEngine:
             engine_version=ENGINE_VERSION,
         )
 
-    async def classify_with_fallback(self, issue: IssueRef, config: dict) -> TriageResult:
+    async def classify_with_fallback(
+        self,
+        issue: IssueRef,
+        config: dict,
+        repo_id: int | None = None,
+        event_id: str | None = None,
+    ) -> TriageResult:
         """
         Rule-based classification first; consult Claude only when confidence is low.
 
@@ -91,32 +118,68 @@ class TriageEngine:
         if self._claude_classifier is None or rule_result.confidence >= self._confidence_threshold:
             return rule_result
 
+        if self._llm_budget is not None and repo_id is not None:
+            if not await self._llm_budget.allow(repo_id):
+                logger.info(
+                    "event_id=%s issue=#%d — Claude skipped by cost gate (rule confidence=%.2f), using rule result",
+                    event_id,
+                    issue.number,
+                    rule_result.confidence,
+                )
+                return replace(rule_result, engine_version=BUDGET_ENGINE_VERSION)
+
         try:
-            claude_result = await self._claude_classifier.classify(issue)
+            claude_result = await self._claude_classifier.classify(issue, event_id=event_id)
         except Exception:
-            logger.exception("Claude classifier raised unexpectedly — falling back to rule result")
+            logger.exception(
+                "event_id=%s issue=#%d — Claude classifier raised unexpectedly, falling back to rule result",
+                event_id,
+                issue.number,
+            )
             claude_result = None
+
+        if self._llm_budget is not None:
+            await self._llm_budget.record(ok=claude_result is not None)
 
         if claude_result is None:
             logger.info(
-                "Claude fallback unavailable/invalid (rule confidence=%.2f) — using rule result",
+                "event_id=%s issue=#%d — Claude fallback unavailable/invalid (rule confidence=%.2f), using rule result",
+                event_id,
+                issue.number,
                 rule_result.confidence,
             )
-            return TriageResult(
-                category=rule_result.category,
-                priority=rule_result.priority,
-                confidence=rule_result.confidence,
-                engine_version=FALLBACK_ENGINE_VERSION,
-            )
+            return replace(rule_result, engine_version=FALLBACK_ENGINE_VERSION)
+
+        claude_result = self._apply_severity_ceiling(claude_result, event_id, issue.number)
 
         logger.info(
-            "Claude fallback used: rule confidence=%.2f -> category=%s priority=%s claude_confidence=%.2f",
+            "event_id=%s issue=#%d — Claude fallback used: rule confidence=%.2f -> category=%s priority=%s "
+            "claude_confidence=%.2f",
+            event_id,
+            issue.number,
             rule_result.confidence,
             claude_result.category,
             claude_result.priority,
             claude_result.confidence,
         )
         return claude_result
+
+    def _apply_severity_ceiling(self, result: TriageResult, event_id: str | None, issue_number: int) -> TriageResult:
+        ceiling = self._claude_max_priority
+        if PRIORITY_ORDER.index(result.priority) >= PRIORITY_ORDER.index(ceiling):
+            return result
+        logger.warning(
+            "event_id=%s issue=#%d — Claude suggested %s, capped at %s (severity ceiling)",
+            event_id,
+            issue_number,
+            result.priority,
+            ceiling,
+        )
+        return replace(
+            result,
+            priority=ceiling,
+            note=f"Priority capped at {ceiling} — AI-suggested {result.priority} needs a human to confirm.",
+        )
 
     def _classify_category(self, labels: list[str], text: str, config: dict) -> tuple[str, float]:
         label_map = self._merge_maps(CATEGORY_LABEL_MAP, config.get("label_map", {}).get("categories", {}))

@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 def _build_explanation(result: TriageResult, assignee_login: str | None) -> str:
     assignee_line = f"@{assignee_login}" if assignee_login else "*no assignee found*"
-    return (
+    explanation = (
         "🤖 **buma triage**\n"
         f"- **Category:** {result.category}\n"
         f"- **Priority:** {result.priority}\n"
@@ -27,6 +27,10 @@ def _build_explanation(result: TriageResult, assignee_login: str | None) -> str:
         f"- **Confidence:** {result.confidence:.0%}\n"
         f"- **Engine version:** {result.engine_version}"
     )
+    # `note` is only ever set by buma's own code (never model output), so it is safe to post publicly.
+    if result.note:
+        explanation += f"\n- **Note:** {result.note}"
+    return explanation
 
 
 def _build_labels(existing: list[str], category: str, priority: str) -> list[str]:
@@ -90,7 +94,9 @@ class EventProcessorService:
             return
 
         # Phase 3 — classify (rule-based, with optional low-confidence Claude fallback)
-        result = await self._engine.classify_with_fallback(event.issue, repo_config.config)
+        result = await self._engine.classify_with_fallback(
+            event.issue, repo_config.config, repo_id=event.repo.id, event_id=event.event_id
+        )
 
         if result.category != "bug":
             logger.info(
