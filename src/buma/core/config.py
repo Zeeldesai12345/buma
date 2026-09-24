@@ -38,6 +38,20 @@ class Settings(BaseSettings):
     claude_model: str = "claude-haiku-4-5-20251001"
     claude_confidence_threshold: float = 0.5
     claude_timeout_seconds: float = 8.0
+    # SDK retries on connection errors, 408, 409, 429 and 5xx. Worst-case latency per event is
+    # roughly (claude_max_retries + 1) * claude_timeout_seconds plus backoff.
+    claude_max_retries: int = 2
+
+    # === Claude guardrails (prompt-injection + cost limits) ===
+    # Issue bodies longer than this are cut before being sent to Claude.
+    claude_max_body_chars: int = 4000
+    # Max Claude calls per repo per UTC day; over budget the rule result is used.
+    claude_daily_call_limit_per_repo: int = 200
+    # After this many consecutive Claude failures, skip Claude for claude_breaker_cooldown_seconds.
+    claude_breaker_threshold: int = 5
+    claude_breaker_cooldown_seconds: int = 300
+    # Most severe priority a Claude-only answer may set. Rule-engine priorities are never capped.
+    claude_max_priority: str = "P1"
 
 
 @lru_cache

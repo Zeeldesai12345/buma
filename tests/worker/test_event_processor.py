@@ -285,6 +285,58 @@ def test_build_explanation_confidence_formatting(confidence: float, expected: st
     assert expected in text
 
 
+def test_build_explanation_includes_note_when_set() -> None:
+    note = "Priority capped at P1 — AI-suggested P0 needs a human to confirm."
+    text = _build_explanation(_make_result(engine_version="claude-hybrid-v1", note=note), "alice")
+    assert f"- **Note:** {note}" in text
+
+
+def test_build_explanation_omits_note_when_unset() -> None:
+    assert "Note" not in _build_explanation(_make_result(), "alice")
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — hybrid (Claude) classification wiring
+# ---------------------------------------------------------------------------
+
+
+def _make_processor_with_engine(result: TriageResult) -> tuple[EventProcessorService, MagicMock, AsyncMock]:
+    """Processor whose TriageEngine is mocked to return `result`. Returns (processor, factory, engine)."""
+    repo_config = MagicMock(spec=RepoConfig)
+    repo_config.config = {}
+    mock_factory = MagicMock(return_value=_make_session(repo_config))
+    mock_engine = MagicMock()
+    mock_engine.classify_with_fallback = AsyncMock(return_value=result)
+    mock_selector = MagicMock(spec=AssigneeSelector)
+    mock_selector.select = AsyncMock(return_value="alice")
+    processor = EventProcessorService(
+        session_factory=mock_factory, triage_engine=mock_engine, assignee_selector=mock_selector
+    )
+    return processor, mock_factory, mock_engine
+
+
+async def test_classify_receives_repo_id_and_event_id() -> None:
+    processor, _, mock_engine = _make_processor_with_engine(_make_result())
+    event = _make_event()
+    await processor.process(event)
+
+    kwargs = mock_engine.classify_with_fallback.call_args.kwargs
+    assert kwargs == {"repo_id": event.repo.id, "event_id": event.event_id}
+
+
+@pytest.mark.parametrize("category", ["security", "docs", "feature", "question"])
+async def test_claude_non_bug_category_skips_persistence(category: str) -> None:
+    claude_result = _make_result(category=category, priority="P1", engine_version="claude-hybrid-v1")
+    processor, mock_factory, _ = _make_processor_with_engine(claude_result)
+
+    await processor.process(_make_event())
+
+    # Only the Phase 2 read session is opened — no Phase 4/5 write session, nothing persisted.
+    assert mock_factory.call_count == 1
+    mock_factory.return_value.add.assert_not_called()
+    mock_factory.return_value.commit.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # _build_labels unit tests
 # ---------------------------------------------------------------------------

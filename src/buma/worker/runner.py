@@ -12,6 +12,7 @@ from buma.worker.consumer import QueueConsumer
 from buma.worker.services.claude_client import ClaudeClassifier
 from buma.worker.services.event_processor import EventProcessorService
 from buma.worker.services.github_client import GitHubClient
+from buma.worker.services.llm_budget import LLMBudget
 from buma.worker.services.triage_engine import TriageEngine
 
 logging.basicConfig(
@@ -44,19 +45,35 @@ async def main() -> None:
         logger.warning("GITHUB_APP_ID or GITHUB_APP_PRIVATE_KEY not set — Phase 6 (GitHub patch) will be skipped")
 
     claude_classifier: ClaudeClassifier | None = None
+    llm_budget: LLMBudget | None = None
     if settings.anthropic_api_key:
         claude_classifier = ClaudeClassifier(
             api_key=settings.anthropic_api_key,
             model=settings.claude_model,
             timeout_seconds=settings.claude_timeout_seconds,
+            max_retries=settings.claude_max_retries,
+            max_body_chars=settings.claude_max_body_chars,
         )
-        logger.info("Claude hybrid fallback classifier configured (model=%s)", settings.claude_model)
+        llm_budget = LLMBudget(
+            redis=redis_client,
+            daily_limit=settings.claude_daily_call_limit_per_repo,
+            breaker_threshold=settings.claude_breaker_threshold,
+            cooldown_seconds=settings.claude_breaker_cooldown_seconds,
+        )
+        logger.info(
+            "Claude hybrid fallback classifier configured (model=%s daily_limit_per_repo=%d max_priority=%s)",
+            settings.claude_model,
+            settings.claude_daily_call_limit_per_repo,
+            settings.claude_max_priority,
+        )
     else:
         logger.warning("ANTHROPIC_API_KEY not set — hybrid Claude fallback disabled, triage stays rule-only")
 
     triage_engine = TriageEngine(
         claude_classifier=claude_classifier,
         confidence_threshold=settings.claude_confidence_threshold,
+        llm_budget=llm_budget,
+        claude_max_priority=settings.claude_max_priority,
     )
 
     try:
