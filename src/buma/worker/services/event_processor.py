@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from datetime import UTC, datetime
 
 import httpx
@@ -11,13 +12,19 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from buma.db.models import DeveloperProfile, DLQRecord, IssueSnapshot, RepoConfig, TriageDecision
 from buma.schemas.normalized_event import NormalizedEvent
 from buma.worker.services.assignee_selector import AssigneeSelector
+from buma.worker.services.duplicate_detector import DuplicateDetector, SimilarIssue
+from buma.worker.services.embedding_service import EmbeddingService
 from buma.worker.services.github_client import GitHubClient
 from buma.worker.services.triage_engine import TriageEngine, TriageResult
 
 logger = logging.getLogger(__name__)
 
 
-def _build_explanation(result: TriageResult, assignee_login: str | None) -> str:
+def _build_explanation(
+    result: TriageResult,
+    assignee_login: str | None,
+    duplicates: Sequence[SimilarIssue] = (),
+) -> str:
     assignee_line = f"@{assignee_login}" if assignee_login else "*no assignee found*"
     explanation = (
         "🤖 **buma triage**\n"
@@ -30,6 +37,11 @@ def _build_explanation(result: TriageResult, assignee_login: str | None) -> str:
     # `note` is only ever set by buma's own code (never model output), so it is safe to post publicly.
     if result.note:
         explanation += f"\n- **Note:** {result.note}"
+    # Only issue numbers, states and scores — never another issue's title/body, which is
+    # attacker-controlled text that must not be reposted under buma's name.
+    if duplicates:
+        matches = ", ".join(f"#{d.issue_number} ({d.issue_state}, similarity {d.similarity:.2f})" for d in duplicates)
+        explanation += f"\n- **Possible duplicate of:** {matches} — flagged only, not closed"
     return explanation
 
 
@@ -49,6 +61,8 @@ class EventProcessorService:
     Phases:
     1. Log receipt
     2. Load RepoConfig from DB — skip if repo not enrolled
+    2b. (optional) Embed the issue, find similar issues, upsert its embedding — every opened issue,
+        own session, never blocks triage (T3 / DD-25)
     3. Classify category + priority (TriageEngine) — skip if not a bug
     4. Assignee selection (skills + capacity + optimistic locking)
     5. Persist IssueSnapshot + TriageDecision
@@ -61,11 +75,17 @@ class EventProcessorService:
         triage_engine: TriageEngine | None = None,
         assignee_selector: AssigneeSelector | None = None,
         github_client: GitHubClient | None = None,
+        embedding_service: EmbeddingService | None = None,
+        duplicate_detector: DuplicateDetector | None = None,
+        duplicate_comment_enabled: bool = False,
     ) -> None:
         self._session_factory = session_factory
         self._engine = triage_engine or TriageEngine()
         self._selector = assignee_selector or AssigneeSelector()
         self._github_client = github_client
+        self._embedding_service = embedding_service
+        self._duplicate_detector = duplicate_detector
+        self._duplicate_comment_enabled = duplicate_comment_enabled
 
     async def process(self, event: NormalizedEvent) -> None:
         if event.action == "closed":
@@ -92,6 +112,10 @@ class EventProcessorService:
                 event.repo.full_name,
             )
             return
+
+        # Phase 2b — semantic indexing. Runs for every opened issue (before the non-bug early
+        # return) so a bug can later match an issue that was filed as a question. Never raises.
+        similar = await self._index_issue(event)
 
         # Phase 3 — classify (rule-based, with optional low-confidence Claude fallback)
         result = await self._engine.classify_with_fallback(
@@ -125,7 +149,8 @@ class EventProcessorService:
         async with self._session_factory() as session:
             assignee_login = await self._selector.select(session, event.repo.id, result.category)
 
-            explanation = _build_explanation(result, assignee_login)
+            duplicates = self._select_duplicates_for_comment(similar)
+            explanation = _build_explanation(result, assignee_login, duplicates)
             session.add(
                 IssueSnapshot(
                     event_id=event.event_id,
@@ -228,6 +253,9 @@ class EventProcessorService:
             )
             return
 
+        # Before the "no triage decision" early return: non-bugs are embedded but have no decision.
+        await self._mark_embedding_closed(event)
+
         async with self._session_factory() as session:
             result = await session.execute(
                 select(TriageDecision)
@@ -306,6 +334,73 @@ class EventProcessorService:
                     )
                 )
             await session.commit()
+
+    async def _index_issue(self, event: NormalizedEvent) -> list[SimilarIssue]:
+        """
+        Phase 2b: embed the issue, look up its nearest neighbours in the same repo, and upsert its
+        embedding — in its own session, so a failure here can never roll back triage writes.
+
+        Never raises: any model or database error is logged and returns [] so triage continues.
+        """
+        if self._embedding_service is None or self._duplicate_detector is None:
+            return []
+
+        try:
+            embedding = await self._embedding_service.embed(event.issue.title, event.issue.body)
+            async with self._session_factory() as session:
+                similar = await self._duplicate_detector.find_similar(
+                    session, event.repo.id, event.issue.number, embedding
+                )
+                await self._duplicate_detector.upsert(session, event.repo.id, event.issue.number, embedding)
+                await session.commit()
+        except Exception:
+            logger.exception(
+                "event_id=%s repo=%s issue=#%d — embedding/duplicate lookup failed, continuing triage without it",
+                event.event_id,
+                event.repo.full_name,
+                event.issue.number,
+            )
+            return []
+
+        # Logged even while duplicate comments are disabled — real similarity scores are useful
+        # evidence when choosing the threshold.
+        logger.info(
+            "event_id=%s repo=%s issue=#%d — embedded; nearest: %s",
+            event.event_id,
+            event.repo.full_name,
+            event.issue.number,
+            ", ".join(f"#{s.issue_number}={s.similarity:.3f}" for s in similar) or "none",
+        )
+        return similar
+
+    def _select_duplicates_for_comment(self, similar: list[SimilarIssue]) -> list[SimilarIssue]:
+        if not self._duplicate_comment_enabled or self._duplicate_detector is None:
+            return []
+        return self._duplicate_detector.filter_duplicates(similar)
+
+    async def _mark_embedding_closed(self, event: NormalizedEvent) -> None:
+        """Keep the embedding (closed issues are exactly what duplicates should match); just flip its state."""
+        if self._duplicate_detector is None:
+            return
+        try:
+            async with self._session_factory() as session:
+                updated = await self._duplicate_detector.mark_closed(session, event.repo.id, event.issue.number)
+                await session.commit()
+        except Exception:
+            logger.exception(
+                "event_id=%s repo=%s issue=#%d — failed to mark embedding closed, continuing",
+                event.event_id,
+                event.repo.full_name,
+                event.issue.number,
+            )
+            return
+        if not updated:
+            logger.info(
+                "event_id=%s repo=%s issue=#%d — no embedding to mark closed (never indexed)",
+                event.event_id,
+                event.repo.full_name,
+                event.issue.number,
+            )
 
     async def _load_repo_config(self, session: AsyncSession, repo_id: int) -> RepoConfig | None:
         result = await session.execute(select(RepoConfig).where(RepoConfig.repo_id == repo_id))

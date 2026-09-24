@@ -152,3 +152,31 @@ No database migration was required — `engine_version` is an existing string co
 **Testing:** `tests/worker/test_claude_parse_guardrail.py` feeds hostile *model outputs* into `_parse_response` (deterministic, CI). `tests/eval/test_prompt_injection_live.py` sends adversarial *issues* from `tests/fixtures/injection_attempts.json` to the real model with the T1 prompt and the hardened prompt and prints the injection success rate for each. It is marked `live`, excluded by default, and run manually with `uv run pytest -m live -s tests/eval`.
 
 **Before adding free-text model output** (e.g. a `reasoning` field in the GitHub comment): strip `@mentions`, neutralise links and images, cap the length, and render it as a labelled blockquote. Today `TriageResult.note` is only ever set by buma's own code.
+
+---
+
+## DD-25 — Semantic duplicate detection with local embeddings and pgvector
+
+**Decision:** Every `opened` issue in an enrolled repo is embedded locally with `fastembed` (`BAAI/bge-small-en-v1.5`, 384-dim, ONNX on CPU) and stored in `issue_embeddings` (Postgres + pgvector). Before storing, the worker looks up the top-k most cosine-similar issues **in the same repo, from the same model, excluding the issue itself**. Duplicates are only ever *flagged* in the existing explanation comment — never closed, relabelled, or commented on separately.
+
+**Why local embeddings, when T1 uses a hosted model:** this step runs on 100% of opened issues, so per-call API cost and latency would scale with all traffic. The hosted LLM (DD-23) only handles the low-confidence minority. A small local model gives good retrieval quality at effectively zero marginal cost, and `fastembed` avoids pulling PyTorch into the image.
+
+**Pipeline placement (`EventProcessorService`):**
+
+| Step | Where | Notes |
+|---|---|---|
+| Phase 2b — embed, search, upsert | After the enrollment check (the table has an FK to `repo_config`), **before** the non-bug early return | Runs for every opened issue so a bug can match an issue filed as a question. Own DB session; `asyncio.to_thread` for inference; never raises — any failure is logged and triage continues |
+| Duplicate line | `_build_explanation(..., duplicates)` | Only if `DUPLICATE_COMMENT_ENABLED=true` and similarity ≥ `DUPLICATE_SIMILARITY_THRESHOLD`. Posts issue numbers, states and scores only — never another issue's text |
+| Closed | `_handle_closed`, before the "no triage decision" return | Sets `issue_state='closed'`; the row is kept because closed issues are exactly what duplicates should match |
+
+**Storage:** `issue_embeddings` has primary key `(repo_id, issue_number)` — one row per issue, not per event, so re-processing overwrites instead of creating a self-match. Columns `embedding vector(384)`, `model_version`, `issue_state` (`open`/`closed`), timestamps; FK to `repo_config` with `ON DELETE CASCADE`; HNSW index with `vector_cosine_ops`. All writes are `INSERT ... ON CONFLICT DO UPDATE`.
+
+**Model lifecycle:** loaded once in `runner.load_duplicate_detection()` (in a thread). If loading fails, the feature is disabled and the worker starts normally. The Docker image bakes the model into `/opt/fastembed_cache`, so there is no runtime download.
+
+**Backfill:** `python -m buma.worker.backfill_embeddings [--repo owner/name] [--force]` pages through the GitHub issues API (pull requests skipped), embeds in batches, and upserts. Re-runs skip issues already embedded with the current model.
+
+**Current status — not production-validated:** `DUPLICATE_COMMENT_ENABLED=false`. Embeddings are stored and searched, and nearest-neighbour scores are logged, but nothing is posted until the threshold is chosen from a labelled eval (recall@5 plus precision/recall on held-out pairs with hard negatives). `DUPLICATE_SIMILARITY_THRESHOLD=0.9` is a placeholder; early spot checks scored obvious duplicate pairs at 0.81–0.87, so 0.9 is likely too strict.
+
+**Known limits:** only `opened`/`closed` are ingested, so edited titles aren't re-embedded and reopened issues stay `closed`. HNSW filters after the index search, so a small repo among many large ones could get fewer than k results (fix: raise `hnsw.ef_search` or partition per repo). Changing `EMBEDDING_MODEL` requires `backfill --force`, because vectors from different models aren't comparable (queries filter on `model_version`).
+
+**Dev database:** the `db` image changed from `postgres:16-alpine` to `pgvector/pgvector:pg16` (Debian). Text collation differs between musl and glibc, so the dev volume was recreated with `docker compose down -v`, not reused.
