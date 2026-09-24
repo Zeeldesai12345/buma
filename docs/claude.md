@@ -86,6 +86,7 @@ tests/
 ├── gateway/
 ├── schemas/
 ├── worker/
+├── integration/  # real Postgres + pgvector (marked `integration`)
 ├── eval/       # live evals against the real Claude API (marked `live`)
 └── fixtures/   # eval data, e.g. injection_attempts.json
 ```
@@ -157,6 +158,7 @@ Use the existing repository structure and inspect the actual files before assumi
 **AI / LLM (optional)**
 
 - Anthropic Claude API (`anthropic` Python SDK) — hybrid triage fallback
+- `fastembed` (local ONNX, CPU) + pgvector — semantic duplicate detection (worker only)
   only, consulted below a confidence threshold. See Section 4.
 
 **Testing**
@@ -304,6 +306,36 @@ When changing the Claude path:
 - Add a hostile case to `tests/worker/test_claude_parse_guardrail.py` for
   any new field the model can return.
 
+### Semantic Duplicate Detection (T3)
+
+Every `opened` issue in an enrolled repo is embedded locally (`fastembed`,
+`BAAI/bge-small-en-v1.5`, 384-dim) and stored in `issue_embeddings`
+(pgvector). The worker searches for the most similar issues **in the same
+repo, from the same model, excluding the issue itself**. See
+[DD-25 in Worker Design](worker-design.md#dd-25--semantic-duplicate-detection-with-local-embeddings-and-pgvector).
+
+- `EmbeddingService` (`embedding_service.py`) is loaded **once** at worker
+  startup; inference runs through `asyncio.to_thread`.
+- `DuplicateDetector` (`duplicate_detector.py`) holds all pgvector queries
+  and the upsert on `(repo_id, issue_number)`.
+- `EventProcessorService` Phase 2b runs before the non-bug early return, in
+  its own session, and never raises.
+- Duplicates are **flagged only** — a line in the existing explanation
+  comment, gated by `DUPLICATE_COMMENT_ENABLED` (currently `false`).
+
+When changing this feature:
+
+- Never close, relabel, or separately comment on an issue because of a
+  duplicate match.
+- Every similarity query must filter on `repo_id` and `model_version`.
+- Never post another issue's title or body in a comment — only numbers,
+  states, and scores.
+- Do not enable `DUPLICATE_COMMENT_ENABLED` or change the threshold without
+  a labelled precision/recall eval.
+- Keep `fastembed` out of `requirements.txt` (the Vercel gateway); only
+  the pure-Python `pgvector` package belongs there.
+- Changing `EMBEDDING_MODEL` requires re-running the backfill with `--force`.
+
 ### Gateway and Worker Separation
 
 Keep Gateway and Worker responsibilities separate.
@@ -355,6 +387,7 @@ tests/
 ├── gateway/
 ├── schemas/
 ├── worker/
+├── integration/  # real Postgres + pgvector (marked `integration`)
 ├── eval/       # live evals against the real Claude API (marked `live`)
 └── fixtures/   # eval data, e.g. injection_attempts.json
 ```
@@ -371,6 +404,11 @@ Smoke-test functionality is located under:
 ```text
 scripts/smoke/
 ```
+
+Tests marked `integration` (under `tests/integration/`) need a real Postgres
+with pgvector and are skipped unless `BUMA_TEST_DATABASE_URL` is set. Each
+test uses a throwaway schema, so it is safe against the Docker dev database:
+`BUMA_TEST_DATABASE_URL=postgresql+psycopg://buma:buma@localhost:5433/buma uv run pytest -m integration`.
 
 Tests marked `live` (under `tests/eval/`) call the real Anthropic API and
 cost money. They are excluded from the default run (`addopts` in
