@@ -89,8 +89,8 @@ class EventProcessorService:
             )
             return
 
-        # Phase 3 — classify
-        result = self._engine.classify(event.issue, repo_config.config)
+        # Phase 3 — classify (rule-based, with optional low-confidence Claude fallback)
+        result = await self._engine.classify_with_fallback(event.issue, repo_config.config)
 
         if result.category != "bug":
             logger.info(

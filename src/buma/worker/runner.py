@@ -9,8 +9,10 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from buma.core.config import get_settings
 from buma.worker.consumer import QueueConsumer
+from buma.worker.services.claude_client import ClaudeClassifier
 from buma.worker.services.event_processor import EventProcessorService
 from buma.worker.services.github_client import GitHubClient
+from buma.worker.services.triage_engine import TriageEngine
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,9 +43,26 @@ async def main() -> None:
     else:
         logger.warning("GITHUB_APP_ID or GITHUB_APP_PRIVATE_KEY not set — Phase 6 (GitHub patch) will be skipped")
 
+    claude_classifier: ClaudeClassifier | None = None
+    if settings.anthropic_api_key:
+        claude_classifier = ClaudeClassifier(
+            api_key=settings.anthropic_api_key,
+            model=settings.claude_model,
+            timeout_seconds=settings.claude_timeout_seconds,
+        )
+        logger.info("Claude hybrid fallback classifier configured (model=%s)", settings.claude_model)
+    else:
+        logger.warning("ANTHROPIC_API_KEY not set — hybrid Claude fallback disabled, triage stays rule-only")
+
+    triage_engine = TriageEngine(
+        claude_classifier=claude_classifier,
+        confidence_threshold=settings.claude_confidence_threshold,
+    )
+
     try:
         processor = EventProcessorService(
             session_factory=session_factory,
+            triage_engine=triage_engine,
             github_client=github_client,
         )
         consumer = QueueConsumer(redis=redis_client, processor=processor)
