@@ -26,7 +26,8 @@ This isn't a script that calls the GitHub API — it's a small distributed syste
 - **Idempotent by design.** Webhook deliveries are deduplicated and retried safely — reprocessing the same event twice never double-assigns or double-comments.
 - **Rule-based first, LLM as a bounded safety net.** Classification runs through deterministic rules by default; only when confidence is low does it optionally consult the Claude API for a second opinion, and any timeout, invalid response, or outage falls back to the rule result automatically — no single point of failure, no unbounded LLM dependency. Issue text is treated as untrusted input: it is truncated and fenced off from instructions, Claude's output is schema-checked, a Claude-only answer can never raise a P0, and a per-repo daily budget plus a circuit breaker cap API spend.
 - **Semantic duplicate detection, at zero API cost.** Every opened issue is embedded locally (`fastembed`, `bge-small-en-v1.5`, CPU) and indexed in Postgres with pgvector, so the worker can find the most similar issues in the same repo. Matches are only ever flagged, never auto-closed. Posting them is switched off until the similarity threshold has been chosen from a labelled eval.
-- **Tested like it matters.** 419 tests across gateway, worker, and schemas, with an 80% coverage gate enforced in CI on every PR — plus a deterministic red-team suite for hostile model output, opt-in pgvector integration tests, and a separate live prompt-injection eval.
+- **Queryable from Claude over MCP — read-only by construction.** A stdio MCP server exposes triage history, developer workload and the enrolled-repo list to Claude Code or Claude Desktop. It shares one query layer with the REST API, runs on a database session Postgres enforces as read-only, and returns GitHub-authored text only in labelled, truncated `untrusted_*` fields.
+- **Tested like it matters.** 467 tests across gateway, worker, and schemas, with an 80% coverage gate enforced in CI on every PR — plus a deterministic red-team suite for hostile model output, opt-in pgvector integration tests, and a separate live prompt-injection eval.
 - **Documented for a stranger to pick up.** Numbered design decisions (`docs/worker-design.md`), a full setup walkthrough (`docs/user-guide.md`), and a 10-scenario UAT script with sign-off tables (`docs/uat.md`) — the kind of documentation a real engineering org expects before something ships.
 
 ---
@@ -137,6 +138,24 @@ uv run python -m buma.worker.runner                        # terminal 2
 
 All `/api/*` routes require an authenticated session (GitHub OAuth).
 
+### MCP server (read-only)
+
+`uv run python -m buma.mcp_server` starts a **stdio** MCP server built on the official MCP Python SDK (see [DD-26](docs/worker-design.md#dd-26--read-only-mcp-server-over-buma-data-stdio)).
+
+| Kind | Name | Returns |
+|---|---|---|
+| Tool | `get_triage_history(repo_id, limit=20)` | Recent triage decisions (limit 1–50), with the issue title and explanation in labelled `untrusted_*` fields. Issue bodies are never returned |
+| Tool | `get_workload(repo_id)` | Each developer's open assignments, capacity and skills |
+| Resource | `buma://repos` | Enrolled repos: `repo_id`, full name, enrolment time |
+
+Register it with Claude Code (the URL must be reachable from your machine — the Docker `db` is on `localhost:5433`):
+
+```bash
+claude mcp add buma -e BUMA_MCP_DATABASE_URL=postgresql+psycopg://buma:buma@localhost:5433/buma -- uv run --directory /path/to/buma python -m buma.mcp_server
+```
+
+Read-only is enforced three ways: only read tools exist, every tool is annotated `readOnlyHint`, and the server's database sessions run with `default_transaction_read_only=on`, so Postgres rejects any write. **Not implemented yet:** the Streamable HTTP transport and OAuth (stdio runs as you, with your own database credentials), and `get_llm_usage`, which waits on T5's `llm_calls` data.
+
 ---
 
 ## Testing & quality gates
@@ -163,17 +182,18 @@ src/buma/
 ├── core/           settings, HMAC security
 ├── db/             ORM models, SQLAlchemy base
 ├── schemas/        gateway↔worker contract + API schemas
-├── gateway/        FastAPI ingest service + dashboard API
+├── gateway/        FastAPI ingest service + dashboard API (+ shared observability queries)
+├── mcp_server/     read-only stdio MCP server (tools + buma://repos)
 └── worker/         async queue consumer + triage pipeline
 
 web-dashboard/       React 19 + MUI + Recharts operator dashboard
-tests/                mirrors src/buma/, 419 tests (+ pgvector integration tests, live evals)
+tests/                mirrors src/buma/, 467 tests (+ Postgres/pgvector integration tests, live evals)
 migrations/           Alembic migrations
 scripts/               lint, test, codegen, smoke test
 docs/
 ├── user-guide.md     install + configure + run, end to end
 ├── uat.md              10-scenario UAT script with sign-off
-└── worker-design.md   numbered design decisions (DD-14…DD-25)
+└── worker-design.md   numbered design decisions (DD-14…DD-26)
 .github/workflows/    CI: lint + test on every PR
 .devcontainer/         reproducible VS Code dev environment
 ```
