@@ -24,8 +24,8 @@ This isn't a script that calls the GitHub API — it's a small distributed syste
 - **Every automated decision is explainable and reversible.** Each triage run writes a decision log row *and* posts a human-readable comment on the issue — category, priority, and why a specific developer was chosen. Nothing is a black box.
 - **Security is not an afterthought.** Webhook deliveries are HMAC-signature verified before anything touches the queue; the dashboard uses real GitHub OAuth 2.0 session auth, not a shared password.
 - **Idempotent by design.** Webhook deliveries are deduplicated and retried safely — reprocessing the same event twice never double-assigns or double-comments.
-- **Rule-based first, LLM as a bounded safety net.** Classification runs through deterministic rules by default; only when confidence is low does it optionally consult the Claude API for a second opinion, and any timeout, invalid response, or outage falls back to the rule result automatically — no single point of failure, no unbounded LLM dependency.
-- **Tested like it matters.** 294 tests across gateway, worker, and schemas, with an 80% coverage gate enforced in CI on every PR — not just a `pytest` folder that exists for show.
+- **Rule-based first, LLM as a bounded safety net.** Classification runs through deterministic rules by default; only when confidence is low does it optionally consult the Claude API for a second opinion, and any timeout, invalid response, or outage falls back to the rule result automatically — no single point of failure, no unbounded LLM dependency. Issue text is treated as untrusted input: it is truncated and fenced off from instructions, Claude's output is schema-checked, a Claude-only answer can never raise a P0, and a per-repo daily budget plus a circuit breaker cap API spend.
+- **Tested like it matters.** 377 tests across gateway, worker, and schemas, with an 80% coverage gate enforced in CI on every PR — plus a deterministic red-team suite for hostile model output and a separate live prompt-injection eval.
 - **Documented for a stranger to pick up.** Numbered design decisions (`docs/worker-design.md`), a full setup walkthrough (`docs/user-guide.md`), and a 10-scenario UAT script with sign-off tables (`docs/uat.md`) — the kind of documentation a real engineering org expects before something ships.
 
 ---
@@ -100,7 +100,7 @@ docker compose up
 
 Docker Compose brings up Postgres and Redis, runs Alembic migrations, then starts the gateway and worker in the right order. See the [User Guide](docs/user-guide.md) for the full walkthrough — GitHub App + OAuth App setup, `ngrok` tunneling, and enrolling your first repo.
 
-**Optional — hybrid Claude fallback:** set `ANTHROPIC_API_KEY` in `.env` to let the worker consult Claude for issues the rule engine classifies with low confidence (see [DD-23](docs/worker-design.md#dd-23--hybrid-claude-api-fallback-for-low-confidence-classifications)). Leave it unset and triage stays 100% rule-based, exactly as before.
+**Optional — hybrid Claude fallback:** set `ANTHROPIC_API_KEY` in `.env` to let the worker consult Claude for issues the rule engine classifies with low confidence (see [DD-23](docs/worker-design.md#dd-23--hybrid-claude-api-fallback-for-low-confidence-classifications)). Leave it unset and triage stays 100% rule-based, exactly as before. The Claude path is guarded against prompt injection and runaway cost (see [DD-24](docs/worker-design.md#dd-24--prompt-injection-guardrail-and-cost-limits-on-the-claude-path)); the limits — `CLAUDE_MAX_BODY_CHARS`, `CLAUDE_DAILY_CALL_LIMIT_PER_REPO`, `CLAUDE_BREAKER_THRESHOLD`, `CLAUDE_BREAKER_COOLDOWN_SECONDS`, `CLAUDE_MAX_PRIORITY` — are documented in `.env.example`.
 
 <details>
 <summary><strong>Host-mode dev (infra in Docker, services on your machine)</strong></summary>
@@ -164,13 +164,13 @@ src/buma/
 └── worker/         async queue consumer + triage pipeline
 
 web-dashboard/       React 19 + MUI + Recharts operator dashboard
-tests/                mirrors src/buma/, 314 tests
+tests/                mirrors src/buma/, 377 tests (+ live evals under tests/eval/)
 migrations/           Alembic migrations
 scripts/               lint, test, codegen, smoke test
 docs/
 ├── user-guide.md     install + configure + run, end to end
 ├── uat.md              10-scenario UAT script with sign-off
-└── worker-design.md   numbered design decisions (DD-14…DD-18)
+└── worker-design.md   numbered design decisions (DD-14…DD-24)
 .github/workflows/    CI: lint + test on every PR
 .devcontainer/         reproducible VS Code dev environment
 ```
