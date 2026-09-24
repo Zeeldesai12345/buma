@@ -1,0 +1,12 @@
+# Runtime dependencies for the Vercel serverless entrypoint (api/index.py).
+# Pinned to match uv.lock. alembic/uvicorn are excluded — they're only used
+# for local/Docker migrations and the dev server, not imported by the gateway app.
+cryptography==46.0.5
+fastapi==0.133.1
+httpx==0.28.1
+psycopg[binary]==3.3.3
+pydantic==2.12.5
+pydantic-settings==2.13.1
+pyjwt[cryptography]==2.12.1
+redis==7.2.1
+sqlalchemy==2.0.46
