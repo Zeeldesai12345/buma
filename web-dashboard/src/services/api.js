@@ -47,6 +47,56 @@ export const observabilityApi = {
 
 
 
+// CHAT ("Ask Buma") APIs
+export const chatApi = {
+  getStatus: () => api.get('/api/chat/status'),
+
+  // Streams one answer as Server-Sent Events. axios can't read a streamed POST body in the
+  // browser, so this uses fetch. Calls onEvent({type, ...}) for each event; resolves when the
+  // stream ends. Rejects with an Error carrying `status` for non-2xx responses.
+  ask: async (repoId, message, history, onEvent, signal) => {
+    const token = localStorage.getItem('token');
+    const response = await fetch(`${API_BASE_URL}/api/chat/${repoId}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ message, history }),
+      signal,
+    });
+
+    if (!response.ok) {
+      let detail = `Request failed (${response.status})`;
+      try {
+        const body = await response.json();
+        if (typeof body.detail === 'string') detail = body.detail;
+      } catch {
+        // non-JSON error body; keep the generic message
+      }
+      const error = new Error(detail);
+      error.status = response.status;
+      throw error;
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const frames = buffer.split('\n\n');
+      buffer = frames.pop();
+      for (const frame of frames) {
+        if (frame.startsWith('data: ')) {
+          onEvent(JSON.parse(frame.slice(6)));
+        }
+      }
+    }
+  },
+};
+
 export const healthCheck = () => api.get('/health');
 
 export default api;

@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from buma.gateway.health import status as health_status
 from buma.gateway.routes.api_auth import router as api_auth_router
 from buma.gateway.routes.auth import router as auth_router
+from buma.gateway.routes.chat import router as chat_router
 from buma.gateway.routes.config import router as config_router
 from buma.gateway.routes.dev import router as dev_router
 from buma.gateway.routes.observability import router as observability_router
@@ -34,6 +35,7 @@ def create_app() -> FastAPI:
     app.include_router(webhook_router)
     app.include_router(config_router)
     app.include_router(observability_router)
+    app.include_router(chat_router)
     app.include_router(dev_router)
 
     return app
