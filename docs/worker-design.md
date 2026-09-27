@@ -214,3 +214,41 @@ Repo discovery is a **resource**, not a tool: the client application decides whe
 **Auth:** stdio has no auth layer; the server runs as the local user with whatever database credentials that user supplies (the same trust level as `psql`).
 
 **Not implemented:** the Streamable HTTP transport and OAuth. The REST API's `require_session` Bearer JWT would be a pragmatic first step for HTTP, but it is not the MCP spec's OAuth 2.1 authorization model, and the REST API itself has no per-repo authorization. `get_llm_usage` is deferred until T5 adds the `llm_calls` table (today `engine_version` is not even a column).
+
+---
+
+## DD-27 — "Ask Buma": agentic RAG chat assistant in the dashboard
+
+**Decision:** The dashboard gets an **Ask Buma** page (`/assistant`) where a signed-in user asks questions about one enrolled repo in plain language ("any open issues about login?", "who has spare capacity?"). The gateway answers with a bounded, streamed tool-use loop against the Claude API (`src/buma/gateway/chat/`). Claude retrieves what it needs through read-only tools. The main one, `search_issues`, is semantic retrieval over the same `issue_embeddings` the worker already maintains (DD-25). This is the first Claude use outside the bounded triage fallback (DD-23), and it was explicitly requested.
+
+**Why agentic RAG rather than "retrieve top-k, then answer":** questions mix unstructured retrieval ("issues about X") with structured facts (workload, productivity, who a decision assigned). A fixed retrieve-then-answer step can't know which of those a question needs. Letting the model pick tools covers both with one loop. The loop is bounded (`CHAT_MAX_TOOL_ROUNDS`, default 6) and every tool is a cheap, read-only query.
+
+**Endpoints (`routes/chat.py`):**
+
+| Endpoint | Notes |
+|---|---|
+| `GET /api/chat/status` | `{enabled, model}`; the page shows a notice when disabled |
+| `POST /api/chat/{repo_id}` | Body `{message, history}` (message ≤ 2000 chars; ≤ 20 prior plain-text turns of ≤ 8000). Responds with Server-Sent Events, one JSON object per `data:` line: `tool`, `text`, `sources`, `error`, then always `done`. 401 without a session, 404 unknown repo, 503 disabled, 429 budget exhausted or breaker open, all checked **before** streaming starts |
+
+The server keeps no conversation state. The browser sends prior turns as plain text; tool results from earlier turns are not replayed. A user could forge the "assistant" turns they send, but that only affects their own answers, which come from data they can already read.
+
+**Tools (`chat/tools.py`):** `search_issues(query, limit≤10)`, `get_issue(issue_number)`, `get_recent_triage(limit≤20)`, `get_workload()`, `get_productivity(window)`. Input schemas are generated from pydantic models (`extra="forbid"`), and those same models validate what the model sends before any query runs. A validation failure goes back to the model as an `is_error` tool_result so it can correct itself.
+
+**Retrieval:**
+- *Semantic:* the question is embedded in the gateway with the worker's model (`EmbeddingService.embed_query`) and matched by cosine distance, **filtered to the repo and to `model_version`**. The model loads lazily on the first question (in a thread, once per process). If it cannot load, the process uses keyword search from then on.
+- *Keyword fallback:* Postgres full-text search (`websearch_to_tsquery`) over snapshot title and body, with the question's words ORed together and ranked by `ts_rank`. Arbitrary input cannot make it raise. No index backs it, which is fine at this scale.
+- The latest `issue_snapshot` and latest `triage_decision` per issue come from `DISTINCT ON` queries. All retrieval SQL lives in `observability_queries.py`, the one query path shared with REST and MCP (DD-26).
+
+**Guardrails:**
+1. **Repo scope is fixed in code.** `repo_id` comes from the URL and is stored in `ToolContext`. No tool schema has a repo field, and a smuggled `repo_id` argument is rejected.
+2. **Read-only at the database.** Chat uses its own engine from the MCP server's factory (`default_transaction_read_only=on`, `statement_timeout=5s`). After a tool's database error the agent rolls back, which is safe only because the connection itself is read-only. There are no write tools.
+3. **Untrusted text.** Titles, bodies (≤ 1500 chars; search excerpts ≤ 300), labels, skills and explanations are returned only through `untrusted_text()` in `untrusted_*` fields with `DATA_NOTICE`, and the system prompt says to treat them as data. As with DD-26, this lowers the odds that injected text is followed; the hard guarantee is that nothing the model does can write anywhere.
+4. **Cost.** There is a separate per-repo daily question budget and a separate circuit breaker (`LLMBudget(namespace="chat")`, keys `buma:chat_*`), so chat can never use up the triage budget (`buma:llm_*`) or trip its breaker. Only `llm_unavailable` outcomes count as breaker failures. Questions that ran fine but hit the round limit do not. Each question also has a hard ceiling on model turns and on `max_tokens` per turn.
+5. **Model output checks.** On `max_tokens` a truncated tool call is never executed. `refusal` stops the loop. Server-side refusal fallbacks are on (`fallbacks: "default"`, beta `server-side-fallback-2026-07-01`). Tools use eager input streaming, so an unparseable tool input causes the turn to be re-issued once and then stops.
+6. **Grounded citations.** The `sources` event lists only issues that the answer cites as `#N` **and** that a tool actually returned. A hallucinated issue number is never shown as a source.
+
+**Model:** `CHAT_MODEL` defaults to `claude-opus-5` with `CHAT_EFFORT=medium`. Adaptive thinking is on by default for this model; thinking blocks are passed back unchanged inside the loop and are not shown to the user. `claude-sonnet-5` is the cheaper option to evaluate.
+
+**Current status — not production-validated:** the loop, tools, route and SQL are covered by unit tests. The SQL also has opt-in Postgres integration tests (`tests/integration/test_chat_retrieval_pg.py`). There has been **no live run against the Claude API yet** and no answer-quality eval. Next steps are a small eval set of real questions with expected issue numbers and facts, grading citation precision and factual accuracy, and comparing Opus 5 with Sonnet 5 at `medium` and `low` effort. Token usage is not yet recorded (that needs T5's `llm_calls`).
+
+**Known limits:** the data is as fresh as ingestion: only `opened`/`closed` events arrive, so edited titles and bodies aren't reflected (DD-25), and only embedded issues are found by semantic search (run the backfill for older issues). HNSW filters after the index search, so a small repo among many large ones can get fewer than `limit` semantic results. There is no per-repo authorization. Any signed-in dashboard user can ask about any enrolled repo, the same as the REST observability routes. Loading the embedding model adds ~100 MB and a few seconds to the first question in each gateway process. On serverless deploys (Vercel), set `CHAT_SEMANTIC_SEARCH_ENABLED=false` to use keyword search.

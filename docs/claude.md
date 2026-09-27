@@ -32,8 +32,10 @@ Do not replace the existing rule-based triage with AI/LLM-based triage
 unless explicitly requested. The Claude API fallback described above was
 explicitly requested and is bounded (low-confidence issues only, with
 automatic fallback to rules on any failure) — it supplements rule-based
-triage, it does not replace it. Do not broaden Claude/LLM usage beyond this
-bounded fallback unless explicitly requested again.
+triage, it does not replace it. The dashboard's "Ask Buma" chat assistant
+(Section 4, DD-27) was also explicitly requested: it only reads data and
+never influences triage. Do not broaden Claude/LLM usage beyond these two
+uses unless explicitly requested again.
 
 ---
 
@@ -71,6 +73,7 @@ The backend is located under:
 src/
 └── buma/
     ├── gateway/
+    │   ├── chat/        # "Ask Buma" chat assistant (DD-27)
     │   └── services/
     ├── mcp_server/
     └── worker/
@@ -162,7 +165,9 @@ Use the existing repository structure and inspect the actual files before assumi
 - Anthropic Claude API (`anthropic` Python SDK) — hybrid triage fallback
 - `fastembed` (local ONNX, CPU) + pgvector — semantic duplicate detection (worker only)
 - `mcp` (official MCP Python SDK, `MCPServer` — formerly `FastMCP`) — read-only stdio MCP server
-  only, consulted below a confidence threshold. See Section 4.
+- Claude API from the gateway — "Ask Buma" chat assistant (read-only agentic RAG, DD-27)
+
+The triage fallback is consulted only below a confidence threshold. See Section 4.
 
 **Testing**
 
@@ -338,6 +343,8 @@ When changing this feature:
 - Keep `fastembed` out of `requirements.txt` (the Vercel gateway); only
   the pure-Python `pgvector` package belongs there.
 - Changing `EMBEDDING_MODEL` requires re-running the backfill with `--force`.
+  The chat assistant embeds questions with the same model, so its semantic
+  search changes too.
 
 ### MCP Server (N1, read-only)
 
@@ -370,6 +377,40 @@ When changing the MCP server:
 - Do not import worker, Claude, GitHub, or embedding code into the server.
 - The Streamable HTTP transport, OAuth, and `get_llm_usage` (needs T5) are
   not implemented; do not document them as available.
+
+### Ask Buma Chat Assistant (DD-27)
+
+`src/buma/gateway/chat/` answers dashboard questions about one repo with a
+bounded, streamed Claude tool-use loop (agentic RAG). See
+[DD-27 in Worker Design](worker-design.md#dd-27--ask-buma-agentic-rag-chat-assistant-in-the-dashboard).
+
+- `agent.py`: the loop. It streams text, runs tools, and stops on answer,
+  refusal, API error or `CHAT_MAX_TOOL_ROUNDS`. It never raises and emits
+  SSE events that always end with `done`.
+- `tools.py`: tool definitions (schemas generated from pydantic input models)
+  and handlers. `runtime.py` holds the process-wide client, the read-only
+  engine, the lazy embedding model and `ChatService`.
+- `routes/chat.py`: `GET /api/chat/status` and `POST /api/chat/{repo_id}`
+  (SSE). Auth, 404, 503 and the budget 429 all happen before streaming.
+
+When changing the chat assistant:
+
+- **Never add a tool that writes, configures or triggers anything.** Tools
+  read through `observability_queries.py` only; never put SQL in a tool.
+- **Never let the model choose the repo.** `repo_id` comes from the URL via
+  `ToolContext`; no tool schema may contain a repo field.
+- Keep the chat engine read-only (`create_readonly_engine`). The rollback
+  after a tool DB error relies on it.
+- Return GitHub-authored text only through `untrusted_text()` in
+  `untrusted_*` fields with `DATA_NOTICE`.
+- Chat spend uses `LLMBudget(namespace="chat")`. Never share the triage
+  budget or breaker keys.
+- Bump `PROMPT_VERSION` in `agent.py` when the system prompt or tools change.
+- `anthropic` is in `requirements.txt` (the Vercel gateway) because of chat;
+  `fastembed` still is not. Without it the embedding model fails to load and
+  chat falls back to keyword search.
+- Answer quality has not been evaluated live yet; do not claim accuracy
+  numbers.
 
 ### Gateway and Worker Separation
 

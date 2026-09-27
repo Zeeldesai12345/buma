@@ -122,3 +122,16 @@ async def test_record_never_raises_on_redis_error() -> None:
     broken.delete.side_effect = ConnectionError("redis down")
     await _budget(broken).record(ok=False)
     await _budget(broken).record(ok=True)
+
+
+async def test_namespaces_keep_budgets_and_breakers_separate(redis: FakeRedis) -> None:
+    triage = LLMBudget(redis, daily_limit=1, breaker_threshold=1, cooldown_seconds=60)
+    chat = LLMBudget(redis, daily_limit=1, breaker_threshold=1, cooldown_seconds=60, namespace="chat")
+
+    assert await chat.allow(7)
+    assert not await chat.allow(7)
+    assert await triage.allow(7)  # chat usage never consumes the triage budget
+
+    await chat.record(ok=False)
+    assert "buma:chat_breaker_open" in redis.store
+    assert "buma:llm_breaker_open" not in redis.store

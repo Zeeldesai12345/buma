@@ -24,6 +24,12 @@ class FakeModel:
         self.cache_dir = cache_dir
         self.dim = dim
         self.calls: list[list[str]] = []
+        self.query_calls: list[list[str]] = []
+
+    def query_embed(self, texts: list[str]):
+        self.query_calls.append(list(texts))
+        for _ in texts:
+            yield [0.5] * self.dim
 
     def embed(self, texts: list[str]):
         self.calls.append(list(texts))
@@ -152,3 +158,19 @@ async def test_model_load_failure_disables_feature_instead_of_crashing() -> None
 
 def test_duplicate_comments_are_disabled_by_default() -> None:
     assert Settings.model_fields["duplicate_comment_enabled"].default is False
+
+
+async def test_embed_query_uses_query_path_and_truncates() -> None:
+    service, model = _service(max_chars=10)
+
+    vector = await service.embed_query("login fails on safari")
+
+    assert vector == [0.5] * 384
+    assert model.query_calls == [["login fail"]]
+    assert model.calls == []
+
+
+async def test_embed_query_rejects_wrong_dimension() -> None:
+    service, _ = _service(dim=12)
+    with pytest.raises(EmbeddingError):
+        await service.embed_query("anything")
