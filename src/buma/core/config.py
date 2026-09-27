@@ -69,6 +69,25 @@ class Settings(BaseSettings):
     # Keep false until the threshold has been chosen from measured precision/recall.
     duplicate_comment_enabled: bool = False
 
+    # === "Ask Buma" chat assistant (DD-27) ===
+    # Gateway-only. Agentic RAG over one repo's live Buma data, streamed to the dashboard.
+    # Needs anthropic_api_key; if either is off, POST /api/chat returns 503.
+    chat_enabled: bool = True
+    chat_model: str = "claude-opus-5"
+    # low | medium | high | xhigh | max — chat Q&A rarely benefits from more than medium.
+    chat_effort: str = "medium"
+    chat_timeout_seconds: float = 60.0
+    chat_max_tokens: int = 8000
+    # Hard cap on model round-trips per question (each round may call several tools).
+    chat_max_tool_rounds: int = 6
+    # Questions per repo per UTC day, and the chat-only circuit breaker (separate from triage's).
+    chat_daily_question_limit_per_repo: int = 100
+    chat_breaker_threshold: int = 5
+    chat_breaker_cooldown_seconds: int = 300
+    # Semantic search embeds the question with the same model the worker used for issues. If the
+    # model can't load in the gateway, search_issues falls back to keyword (title/body) search.
+    chat_semantic_search_enabled: bool = True
+
 
 @lru_cache
 def get_settings() -> Settings:

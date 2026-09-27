@@ -23,6 +23,7 @@ import axios from 'axios';
 import FolderIcon from '@mui/icons-material/Folder';
 import TrendingUpIcon from '@mui/icons-material/TrendingUp';
 import BugReportIcon from '@mui/icons-material/BugReport';
+import SmartToyIcon from '@mui/icons-material/SmartToy';
 
 const drawerWidth = 260;
 
@@ -32,6 +33,7 @@ const menuItems = [
   { text: 'People', icon: <PeopleIcon />, path: '/team' },
   { text: 'Productivity', icon: <TrendingUpIcon />, path: '/productivity' },
   { text: 'Issues', icon: <BugReportIcon />, path: '/issues' },
+  { text: 'Ask Buma', icon: <SmartToyIcon />, path: '/assistant' },
   { text: 'Setup', icon: <SettingsIcon />, path: '/setup' },
 ];
 

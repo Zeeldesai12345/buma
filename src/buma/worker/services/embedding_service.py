@@ -64,8 +64,19 @@ class EmbeddingService:
         texts = [self.build_text(title, body) for title, body in issues]
         return await asyncio.to_thread(self._embed_sync, texts)
 
-    def _embed_sync(self, texts: list[str]) -> list[list[float]]:
-        vectors = [[float(x) for x in vector] for vector in self._model.embed(texts)]
+    async def embed_query(self, query: str) -> list[float]:
+        """
+        Embed a free-text search query (chat assistant, DD-27) through fastembed's query path.
+        For bge-small-en-v1.5 fastembed adds no instruction prefix; BGE v1.5 is trained to work
+        without one. Adding "Represent this sentence for searching relevant passages: " is an
+        option to evaluate, not a known win.
+        """
+        [vector] = await asyncio.to_thread(self._embed_sync, [query[: self._max_chars]], True)
+        return vector
+
+    def _embed_sync(self, texts: list[str], is_query: bool = False) -> list[list[float]]:
+        raw = self._model.query_embed(texts) if is_query else self._model.embed(texts)
+        vectors = [[float(x) for x in vector] for vector in raw]
         if len(vectors) != len(texts):
             raise EmbeddingError(f"Embedding model returned {len(vectors)} vectors for {len(texts)} inputs")
         for vector in vectors:

@@ -27,7 +27,8 @@ This isn't a script that calls the GitHub API — it's a small distributed syste
 - **Rule-based first, LLM as a bounded safety net.** Classification runs through deterministic rules by default; only when confidence is low does it optionally consult the Claude API for a second opinion, and any timeout, invalid response, or outage falls back to the rule result automatically — no single point of failure, no unbounded LLM dependency. Issue text is treated as untrusted input: it is truncated and fenced off from instructions, Claude's output is schema-checked, a Claude-only answer can never raise a P0, and a per-repo daily budget plus a circuit breaker cap API spend.
 - **Semantic duplicate detection, at zero API cost.** Every opened issue is embedded locally (`fastembed`, `bge-small-en-v1.5`, CPU) and indexed in Postgres with pgvector, so the worker can find the most similar issues in the same repo. Matches are only ever flagged, never auto-closed. Posting them is switched off until the similarity threshold has been chosen from a labelled eval.
 - **Queryable from Claude over MCP — read-only by construction.** A stdio MCP server exposes triage history, developer workload and the enrolled-repo list to Claude Code or Claude Desktop. It shares one query layer with the REST API, runs on a database session Postgres enforces as read-only, and returns GitHub-authored text only in labelled, truncated `untrusted_*` fields.
-- **Tested like it matters.** 467 tests across gateway, worker, and schemas, with an 80% coverage gate enforced in CI on every PR — plus a deterministic red-team suite for hostile model output, opt-in pgvector integration tests, and a separate live prompt-injection eval.
+- **Ask Buma — an agentic RAG assistant in the dashboard.** Users ask about a repo in plain language ("any open issues about login?", "who has spare capacity?") and get a streamed answer grounded in live data. Claude calls read-only, repo-scoped tools. Its main retrieval tool is semantic search over the same pgvector issue embeddings, with Postgres full-text search as the fallback. Every cited issue is checked against what the tools actually returned. Chat has its own daily budget and circuit breaker, so it can never use up triage's Claude budget.
+- **Tested like it matters.** 537 tests across gateway, worker, and schemas, with an 80% coverage gate enforced in CI on every PR — plus a deterministic red-team suite for hostile model output, opt-in pgvector integration tests, and a separate live prompt-injection eval.
 - **Documented for a stranger to pick up.** Numbered design decisions (`docs/worker-design.md`), a full setup walkthrough (`docs/user-guide.md`), and a 10-scenario UAT script with sign-off tables (`docs/uat.md`) — the kind of documentation a real engineering org expects before something ships.
 
 ---
@@ -156,6 +157,19 @@ claude mcp add buma -e BUMA_MCP_DATABASE_URL=postgresql+psycopg://buma:buma@loca
 
 Read-only is enforced three ways: only read tools exist, every tool is annotated `readOnlyHint`, and the server's database sessions run with `default_transaction_read_only=on`, so Postgres rejects any write. **Not implemented yet:** the Streamable HTTP transport and OAuth (stdio runs as you, with your own database credentials), and `get_llm_usage`, which waits on T5's `llm_calls` data.
 
+### Ask Buma (chat assistant)
+
+The dashboard's **Ask Buma** page answers questions about one enrolled repo, streaming the reply as Server-Sent Events from `POST /api/chat/{repo_id}` (see [DD-27](docs/worker-design.md#dd-27--ask-buma-agentic-rag-chat-assistant-in-the-dashboard)). It needs `ANTHROPIC_API_KEY` on the gateway and is configured with the `CHAT_*` settings in `.env.example`.
+
+| Tool Claude can call | What it reads |
+|---|---|
+| `search_issues(query, limit)` | Semantic search over `issue_embeddings` (keyword fallback), with each hit's latest triage decision |
+| `get_issue(issue_number)` | Latest snapshot (body truncated) and latest triage decision |
+| `get_recent_triage(limit)` | Most recent triage decisions |
+| `get_workload()` / `get_productivity(window)` | Developer capacity, resolved counts and resolution time |
+
+The repo comes from the URL, never from the model. The tools run on a database connection Postgres enforces as read-only, and GitHub-authored text reaches the model only in labelled `untrusted_*` fields. **Not yet validated:** there has been no live answer-quality eval, and token usage isn't recorded until T5.
+
 ---
 
 ## Testing & quality gates
@@ -182,18 +196,18 @@ src/buma/
 ├── core/           settings, HMAC security
 ├── db/             ORM models, SQLAlchemy base
 ├── schemas/        gateway↔worker contract + API schemas
-├── gateway/        FastAPI ingest service + dashboard API (+ shared observability queries)
+├── gateway/        FastAPI ingest service + dashboard API (+ shared observability queries, chat/ assistant)
 ├── mcp_server/     read-only stdio MCP server (tools + buma://repos)
 └── worker/         async queue consumer + triage pipeline
 
 web-dashboard/       React 19 + MUI + Recharts operator dashboard
-tests/                mirrors src/buma/, 467 tests (+ Postgres/pgvector integration tests, live evals)
+tests/                mirrors src/buma/, 537 tests (+ Postgres/pgvector integration tests, live evals)
 migrations/           Alembic migrations
 scripts/               lint, test, codegen, smoke test
 docs/
 ├── user-guide.md     install + configure + run, end to end
 ├── uat.md              10-scenario UAT script with sign-off
-└── worker-design.md   numbered design decisions (DD-14…DD-26)
+└── worker-design.md   numbered design decisions (DD-14…DD-27)
 .github/workflows/    CI: lint + test on every PR
 .devcontainer/         reproducible VS Code dev environment
 ```

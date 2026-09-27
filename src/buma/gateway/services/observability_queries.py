@@ -8,12 +8,13 @@ There is exactly one query path per dataset; do not copy SQL into routes or MCP 
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 
-from sqlalchemy import RowMapping, func, select, text
+from sqlalchemy import RowMapping, func, literal_column, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from buma.db.models import DeveloperProfile, IssueSnapshot, RepoConfig, TriageDecision
+from buma.db.models import DeveloperProfile, IssueEmbedding, IssueSnapshot, RepoConfig, TriageDecision
 
 # Maps window → (lookback interval, bucket trunc unit, bucket step interval)
 # All strings are compile-time constants — safe to embed directly in SQL via f-string.
@@ -153,3 +154,85 @@ async def get_issue_page(
         .offset(offset)
     )
     return list(rows_result.scalars().all()), total
+
+
+# ---------------------------------------------------------------------------
+# Retrieval for the "Ask Buma" chat assistant (DD-27)
+# ---------------------------------------------------------------------------
+
+
+async def search_issues_by_embedding(
+    db: AsyncSession, repo_id: int, model_version: str, embedding: Sequence[float], limit: int
+) -> list[tuple[int, str, float]]:
+    """
+    Nearest issues to `embedding` in one repo: (issue_number, issue_state, cosine similarity),
+    most similar first. Only vectors from `model_version` are compared — vectors from different
+    embedding models are not comparable.
+    """
+    distance = IssueEmbedding.embedding.cosine_distance(list(embedding))
+    result = await db.execute(
+        select(IssueEmbedding.issue_number, IssueEmbedding.issue_state, (1 - distance).label("similarity"))
+        .where(IssueEmbedding.repo_id == repo_id, IssueEmbedding.model_version == model_version)
+        .order_by(distance)
+        .limit(limit)
+    )
+    return [(row.issue_number, row.issue_state, float(row.similarity)) for row in result]
+
+
+_KEYWORD_TERM = re.compile(r"\w+")
+MAX_KEYWORD_TERMS = 12
+
+
+async def search_issues_by_keyword(db: AsyncSession, repo_id: int, query: str, limit: int) -> list[int]:
+    """
+    Full-text fallback when semantic search is unavailable: issue numbers whose title/body match ANY
+    word of `query`, ranked by ts_rank (more matching words rank higher). Words are extracted with
+    a regex and joined with `or` for websearch_to_tsquery, which never raises on odd input.
+    Stop words are dropped by the 'english' config. No index backs this — fine at this scale.
+    """
+    terms = _KEYWORD_TERM.findall(query)[:MAX_KEYWORD_TERMS]
+    if not terms:
+        return []
+    document = func.to_tsvector(
+        literal_column("'english'"), IssueSnapshot.title + " " + func.coalesce(IssueSnapshot.body, "")
+    )
+    tsquery = func.websearch_to_tsquery(literal_column("'english'"), " or ".join(terms))
+    rank = func.max(func.ts_rank(document, tsquery)).label("rank")
+    result = await db.execute(
+        select(IssueSnapshot.issue_number, rank)
+        .where(IssueSnapshot.repo_id == repo_id, document.op("@@")(tsquery))
+        .group_by(IssueSnapshot.issue_number)
+        .order_by(rank.desc(), IssueSnapshot.issue_number.desc())
+        .limit(limit)
+    )
+    return [row.issue_number for row in result]
+
+
+async def get_latest_snapshots(
+    db: AsyncSession, repo_id: int, issue_numbers: Sequence[int]
+) -> dict[int, IssueSnapshot]:
+    """The most recent issue_snapshot per issue number. Issues never snapshotted are omitted."""
+    if not issue_numbers:
+        return {}
+    result = await db.execute(
+        select(IssueSnapshot)
+        .where(IssueSnapshot.repo_id == repo_id, IssueSnapshot.issue_number.in_(list(issue_numbers)))
+        .distinct(IssueSnapshot.issue_number)
+        .order_by(IssueSnapshot.issue_number, IssueSnapshot.snapshot_at.desc())
+    )
+    return {row.issue_number: row for row in result.scalars().all()}
+
+
+async def get_latest_decisions(
+    db: AsyncSession, repo_id: int, issue_numbers: Sequence[int]
+) -> dict[int, TriageDecision]:
+    """The most recent triage_decision per issue number. Issues never triaged are omitted."""
+    if not issue_numbers:
+        return {}
+    result = await db.execute(
+        select(TriageDecision)
+        .where(TriageDecision.repo_id == repo_id, TriageDecision.issue_number.in_(list(issue_numbers)))
+        .distinct(TriageDecision.issue_number)
+        .order_by(TriageDecision.issue_number, TriageDecision.decided_at.desc())
+    )
+    return {row.issue_number: row for row in result.scalars().all()}

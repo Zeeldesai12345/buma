@@ -13,6 +13,7 @@ import RepositorySetup from './pages/RepositorySetup';
 import ProtectedRoute from './components/ProtectedRoute';
 import Productivity from './pages/Productivity';
 import Issues from './pages/Issues';
+import Assistant from './pages/Assistant';
 
 const theme = createTheme({
   palette: {
@@ -48,6 +49,7 @@ function App() {
             <Route path="productivity" element={<Productivity />} />
             <Route path="setup" element={<RepositorySetup />} />
             <Route path="issues" element={<Issues />} />
+            <Route path="assistant" element={<Assistant />} />
             <Route path="analytics" element={<div>Analytics - Coming Soon</div>} />
             <Route path="settings" element={<div>Settings - Coming Soon</div>} />
           </Route>
