@@ -2,9 +2,6 @@
 
 A step-by-step guide for first-time users: clone, configure, install, and use Buma.
 
-> **Demo video:** Watch a full walkthrough of Buma in action:
-> https://stevens.zoom.us/rec/share/DpeGj3KoGgIkXlwmR3SSpuH__39eKzjHtn9kkbzFWN42T6k-wy4XPu1xdiyueV37.emvdavdLR5sSbDlY?startTime=1776824419000
-
 ---
 
 ## What is Buma?
@@ -39,8 +36,8 @@ Before you begin, make sure you have the following installed:
 ## Step 1 — Clone the Repository
 
 ```bash
-git clone https://github.com/SE4AIResearch/SSW695-Group2.git
-cd SSW695-Group2
+git clone https://github.com/Zeeldesai12345/buma.git
+cd buma
 ```
 
 ---
@@ -81,7 +78,7 @@ The dashboard login uses GitHub OAuth. You need a separate **OAuth App** for thi
 2. Fill in:
    - **Application name:** `buma-dashboard` (or anything)
    - **Homepage URL:** `http://localhost:3000`
-   - **Authorization callback URL:** `http://localhost:8000/auth/callback`
+   - **Authorization callback URL:** `http://localhost:3000/auth/callback` (the dashboard's callback page, which sends the code to the gateway and stores the returned session token)
 3. Click **Register application**.
 4. On the next page, click **Generate a new client secret**.
 5. Copy both the **Client ID** and **Client Secret**.
@@ -154,7 +151,7 @@ You should see output like:
 
 ```
 gateway-1  | INFO:     Application startup complete.
-worker-1   | [worker] polling buma:triage:queue …
+worker-1   | ... Queue consumer started on key 'buma:triage:queue'
 ```
 
 Leave this terminal running, or run detached with `docker compose up -d`.
@@ -197,24 +194,28 @@ Before Buma will triage issues, you must enroll the repository and define its de
 
 ### Via the Dashboard
 
-1. In the sidebar, click **Configuration**.
-2. Click **Add Repository**.
-3. Enter the repository's full name (e.g. `myorg/myrepo`) and any initial settings.
-4. Click **Save**.
+1. In the sidebar, click **Setup**.
+2. Enter the **GitHub Repository ID** (numeric), the **GitHub Installation ID** of your GitHub App installation, and the **Repository Full Name** (e.g. `myorg/myrepo`).
+3. Optionally map existing repository labels to Buma categories and priorities.
+4. Submit the form. The repository then appears on the **Repositories** page.
+
+> The numeric repository ID is available from `https://api.github.com/repos/<owner>/<repo>` (`id` field). The installation ID is the number at the end of the installation's settings URL (`https://github.com/settings/installations/<id>`).
 
 ### Via the API (curl)
 
 ```bash
 curl -X POST http://localhost:8000/api/config/repos \
   -H "Content-Type: application/json" \
-  -b "<your session cookie>" \
+  -H "Authorization: Bearer <session token>" \
   -d '{
+    "repo_id": 123456789,
+    "installation_id": 98765432,
     "repo_full_name": "myorg/myrepo",
     "config": {}
   }'
 ```
 
-> All `/api/*` routes require you to be logged in. Pass the session cookie from the browser, or use the dashboard UI.
+> All `/api/*` routes require a session token in the `Authorization: Bearer` header. After signing in to the dashboard, the token is stored in the browser's `localStorage` under the key `token`.
 
 ---
 
@@ -224,21 +225,23 @@ Buma uses developer profiles to choose assignees. Each profile records skills an
 
 ### Via the Dashboard
 
-1. Open the **Configuration** page for your repository.
+1. In the sidebar, click **People** and select your repository.
 2. Click **Add Developer**.
-3. Fill in the GitHub login, skills (comma-separated tags), and capacity (a number — higher = more available).
+3. Fill in the GitHub username, skills, and maximum capacity (the number of open assignments the developer can hold, 1–100).
 4. Click **Save**.
+
+Skills are issue categories: `bug`, `feature`, `question`, `security`, `docs`. Buma assigns only `bug` issues, so a developer needs the `bug` skill to be eligible for assignment.
 
 ### Via the API (curl)
 
 ```bash
 curl -X POST http://localhost:8000/api/config/repos/<repo_id>/developers \
   -H "Content-Type: application/json" \
-  -b "<session cookie>" \
+  -H "Authorization: Bearer <session token>" \
   -d '{
-    "login": "octocat",
-    "skills": ["python", "backend", "auth"],
-    "capacity": 5
+    "github_login": "octocat",
+    "skills": ["bug"],
+    "max_capacity": 5
   }'
 ```
 
@@ -350,18 +353,22 @@ Once the stack is running, the app enrolled, and the webhook registered, Buma wo
 Within seconds, Buma will:
 
 - Receive the webhook event
-- Classify the issue as a bug and set a priority
-- Select a developer from the enrolled team
-- Apply a label (e.g. `priority:high`) and set the assignee
-- Post a comment explaining the decision
+- Classify the issue's category and priority
+- For issues classified as `bug`: select a developer from the enrolled team, add the category and priority labels (e.g. `bug` and `P1`), set the assignee, and post a comment explaining the decision
+
+Issues classified as another category (feature, question, security, docs) are not assigned or updated.
 
 ### View triage history
 
-In the dashboard, click **Triage History** in the sidebar. You will see a paginated list of every triage decision, including the assigned developer, priority, and the explanation that was posted as a comment.
+The dashboard **Home** page summarises the selected repository's triage decisions, including a **Recent Activity** list. The **Issues** page lists the persisted issue snapshots.
 
 ### View developer workload
 
-Click **Developer Workload** to see how many open assignments each developer currently has.
+Click **People** to see each developer's open assignments against their capacity, and **Productivity** for resolved-issue counts and average resolution time.
+
+### Ask Buma
+
+If `ANTHROPIC_API_KEY` is set on the gateway, the **Ask Buma** page answers natural-language questions about the selected repository. See the [README](../README.md#ask-buma-agentic-rag-assistant) for details.
 
 ---
 
@@ -382,7 +389,7 @@ Click **Developer Workload** to see how many open assignments each developer cur
 | `GET` | `/api/triage/{repo_id}` | Triage decision history (paginated) |
 | `GET` | `/api/workload/{repo_id}` | Developer workload view |
 
-All `/api/*` routes require a valid session cookie (GitHub OAuth login).
+All `/api/*` routes except `/api/v1/auth/github` require a Bearer session token (GitHub OAuth login). Additional routes (issues, productivity, Ask Buma) are listed in the [README API reference](../README.md#api-reference).
 
 Interactive API docs are available at **http://localhost:8000/docs** while the gateway is running.
 
@@ -405,7 +412,9 @@ docker compose down -v
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `migrate` service exits with an error | Database not yet ready | Re-run `docker compose up` — healthchecks should prevent this |
-| Gateway returns 401 on `/api/*` | Not logged in | Visit `http://localhost:8000/auth/github` and log in |
+| Gateway returns 401 on `/api/*` | Not logged in, or session expired (8 hours) | Sign in again through the dashboard with **Sign in with GitHub** |
+| GitHub login ends on a JSON page instead of the dashboard | OAuth App callback URL points at the gateway | Set the OAuth App callback URL to `http://localhost:3000/auth/callback` (Step 3) |
+| Issues are triaged but nobody is assigned | No developer has the `bug` skill, or all are at capacity | Check the **People** page (Step 9) |
 | Issues are not being triaged | Repo not enrolled or webhook not registered | Check Steps 8 and 10 |
 | Webhook deliveries show red X in GitHub | ngrok not running or wrong URL | Restart ngrok (Step 10e) and confirm the URL in your GitHub App settings matches |
 | ngrok URL changes every restart | No static domain claimed | Claim a free static domain (Step 10d) |
@@ -424,4 +433,4 @@ docker compose down -v
 | **Enrolled repository** | A repo Buma is configured to triage (must be done via the dashboard or API) |
 | **Developer profile** | A record of a developer's skills and capacity, used for assignee selection |
 | **Triage decision** | The output of the triage pipeline: category, priority, assignee, and explanation |
-| **DLQ (Dead-Letter Queue)** | Events that failed all processing attempts — visible in the `dlq_records` table |
+| **DLQ (Dead-Letter Queue)** | Events whose GitHub update failed with a non-transient error, recorded in the `dlq_records` table |
