@@ -1,10 +1,9 @@
 # Buma — User Acceptance Testing (UAT) Script
 
 **Product:** Buma — Intelligent Bug Triaging & Assignment System
-**Repository:** https://github.com/SE4AIResearch/SSW695-Group2
-**Demo video:** https://stevens.zoom.us/rec/share/DpeGj3KoGgIkXlwmR3SSpuH__39eKzjHtn9kkbzFWN42T6k-wy4XPu1xdiyueV37.emvdavdLR5sSbDlY?startTime=1776824419000
+**Repository:** https://github.com/Zeeldesai12345/buma
 
-**Audience:** Professor, peer reviewers, and teammates from other project groups.
+**Audience:** Reviewers and acceptance testers.
 No familiarity with Buma's codebase is required. Follow each step exactly as written.
 
 ---
@@ -87,9 +86,9 @@ A test **passes** only when the actual result fully matches the expected result.
 
 | # | Step | Expected Result | Actual Result | Pass / Fail |
 |---|---|---|---|---|
-| 1 | In the dashboard sidebar, click **Configuration** | The configuration page loads | | |
+| 1 | In the dashboard sidebar, click **Repositories** | The repositories page loads | | |
 | 2 | Locate the enrolled repository in the list | The repository name (e.g. `myorg/myrepo`) is displayed | | |
-| 3 | Click on the repository or open its detail view | A list of developer profiles is shown, each with a name and skills | | |
+| 3 | Click **People** and select the repository | A list of developer profiles is shown, each with a GitHub username and skills | | |
 | 4 | Confirm at least two developers are listed | At least two developer entries are visible | | |
 
 **Notes:**
@@ -107,10 +106,10 @@ A test **passes** only when the actual result fully matches the expected result.
 | 1 | Go to the enrolled GitHub repository in your browser | The repository page loads | | |
 | 2 | Click **Issues** → **New issue** | The new issue form opens | | |
 | 3 | Enter a title that clearly describes a bug, e.g. *"Login button crashes on mobile"*. Leave the body blank. Click **Submit new issue** | The issue is created on GitHub | | |
-| 4 | Wait up to 30 seconds, then refresh the issue page | A **label** (e.g. `priority:high` or `priority:medium`) has been applied to the issue | | |
+| 4 | Wait up to 30 seconds, then refresh the issue page | The category and priority **labels** (e.g. `bug` and `P1`) have been applied to the issue | | |
 | 5 | On the same issue page, check the **Assignees** section | A developer has been automatically assigned | | |
 | 6 | Scroll down to the comments section | Buma has posted a comment explaining why this developer was chosen and what priority was assigned | | |
-| 7 | Go back to the Buma dashboard and click **Triage History** | The issue you just created appears as the most recent entry in the triage history list | | |
+| 7 | Go back to the Buma dashboard **Home** page | The issue you just created appears in the **Recent Activity** list | | |
 
 **Notes:**
 
@@ -140,7 +139,7 @@ A test **passes** only when the actual result fully matches the expected result.
 
 | # | Step | Expected Result | Actual Result | Pass / Fail |
 |---|---|---|---|---|
-| 1 | In the dashboard, click **Triage History** | A list of past triage decisions loads | | |
+| 1 | In the dashboard, open the **Home** page | The **Recent Activity** list of triage decisions loads | | |
 | 2 | Locate the entry for the bug issue created in Scenario 4 | The entry shows the issue title (or ID), assigned developer, and priority | | |
 | 3 | Confirm the decision matches what appeared on the GitHub issue | The assignee and priority in the dashboard match the label and assignee set on the GitHub issue | | |
 
@@ -156,7 +155,7 @@ A test **passes** only when the actual result fully matches the expected result.
 
 | # | Step | Expected Result | Actual Result | Pass / Fail |
 |---|---|---|---|---|
-| 1 | In the dashboard, click **Developer Workload** (or **Workload**) | A workload page loads showing each developer | | |
+| 1 | In the dashboard, click **People** | A page loads showing each developer's open assignments and capacity | | |
 | 2 | Find the developer who was assigned in Scenario 4 | Their open assignment count is at least 1 | | |
 | 3 | Confirm other developers are also listed | The full team is shown, not just the assigned developer | | |
 
@@ -172,9 +171,9 @@ A test **passes** only when the actual result fully matches the expected result.
 
 | # | Step | Expected Result | Actual Result | Pass / Fail |
 |---|---|---|---|---|
-| 1 | Go to **Configuration** and open the repository detail view | The developer list is shown | | |
+| 1 | Go to **People** and select the repository | The developer list is shown | | |
 | 2 | Click **Add Developer** | A form appears asking for GitHub login, skills, and capacity | | |
-| 3 | Enter a valid GitHub username, at least one skill (e.g. `frontend`), and a capacity value (e.g. `3`). Click **Save** | The new developer appears in the list without a page error | | |
+| 3 | Enter a valid GitHub username, at least one skill (e.g. `bug`), and a capacity value (e.g. `3`). Click **Save** | The new developer appears in the list without a page error | | |
 | 4 | Refresh the page | The new developer is still listed — the save persisted | | |
 
 **Notes:**
