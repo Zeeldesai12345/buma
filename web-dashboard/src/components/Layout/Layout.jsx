@@ -25,6 +25,8 @@ import TrendingUpIcon from '@mui/icons-material/TrendingUp';
 import BugReportIcon from '@mui/icons-material/BugReport';
 import SmartToyIcon from '@mui/icons-material/SmartToy';
 
+const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+
 const drawerWidth = 260;
 
 const menuItems = [
@@ -54,7 +56,7 @@ export default function Layout() {
   const handleLogout = async () => {
     try {
       // Call backend logout endpoint
-      await axios.post('http://localhost:8000/auth/logout', {}, {
+      await axios.post(`${API_URL}/auth/logout`, {}, {
         headers: {
           Authorization: `Bearer ${authService.getToken()}`
         }
