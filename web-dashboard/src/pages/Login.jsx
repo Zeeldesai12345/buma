@@ -17,6 +17,8 @@ import GitHubIcon from '@mui/icons-material/GitHub';
 import AccessTimeIcon from '@mui/icons-material/AccessTime';
 import { authService } from '../services/auth';
 
+const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+
 export default function Login() {
   const navigate = useNavigate();
   const [email, setEmail] = useState('');
@@ -54,7 +56,7 @@ export default function Login() {
   };
 
   const handleGitHubLogin = () => {
-    window.location.href = 'http://localhost:8000/auth/github';
+    window.location.href = `${API_URL}/auth/github`;
   };
 
   return (
